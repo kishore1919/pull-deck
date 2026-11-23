@@ -1,0 +1,6 @@
+{
+  "name": "PullDeck",
+  "description": "Stateless bulk and single media downloader studio for Instagram posts, reels, stories, highlights, and Reddit posts, galleries, videos, and subreddits.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,124 @@
+export type Platform = 'instagram' | 'reddit' | 'redgifs';
+
+export type ContentType =
+  | 'ig_profile'
+  | 'ig_post'
+  | 'ig_reel'
+  | 'ig_story'
+  | 'ig_highlight'
+  | 'reddit_post'
+  | 'reddit_subreddit'
+  | 'reddit_user'
+  | 'redgifs_clip'
+  | 'redgifs_profile'
+  | 'unknown';
+
+export type MediaType = 'image' | 'video';
+
+export type JobStatus =
+  | 'queued'
+  | 'extracting'
+  | 'ready'
+  | 'auth_required'
+  | 'error';
+
+export interface ParsedUrlEntry {
+  raw: string;
+  normalized: string;
+  platform: Platform | null;
+  contentType: ContentType;
+  label: string;
+  valid: boolean;
+  reason?: string;
+}
+
+export interface MediaItem {
+  id: string;
+  jobId: string;
+  platform: Platform;
+  contentType: ContentType;
+  mediaType: MediaType;
+  title: string;
+  author: string;
+  sourceContainer: string; // e.g., r/architecture, @username, or redgifs/@user
+  sourceUrl: string;
+  mediaUrl: string;
+  thumbnailUrl: string;
+  filename: string;
+  extension: string;
+  width?: number;
+  height?: number;
+  durationSec?: number;
+  indexInGroup: number;
+  groupSize: number;
+  createdAt?: string;
+  hasAudioTrack?: boolean;
+}
+
+export interface ExtractionJob {
+  id: string;
+  sourceUrl: string;
+  platform: Platform | null;
+  contentType: ContentType;
+  contentLabel: string;
+  status: JobStatus;
+  message: string;
+  itemCount: number;
+  totalAvailable?: number;
+  resolverUsed?: string;
+  authHint?: string;
+  hasMore?: boolean;
+  nextCursor?: string;
+  pageNumber?: number;
+}
+
+export interface BatchExtractRequest {
+  urls: string[];
+  subredditLimit?: number;
+  subredditSort?: 'hot' | 'top' | 'new';
+  cursor?: string;
+  pageNumber?: number;
+}
+
+export interface BatchExtractResponse {
+  jobs: ExtractionJob[];
+  items: MediaItem[];
+  processedAt: string;
+}
+
+export interface ZipOptions {
+  organizeByFolder: boolean;
+  includeMetadataJson: boolean;
+}
+
+export interface ZipDownloadItem {
+  id: string;
+  platform: Platform;
+  sourceContainer: string;
+  author: string;
+  title: string;
+  mediaUrl: string;
+  sourceUrl: string;
+  filename: string;
+  mediaType: MediaType;
+}
+
+export interface ZipDownloadRequest {
+  items: ZipDownloadItem[];
+  options: ZipOptions;
+  partLabel?: string;
+}
+
+export interface CapabilitiesResponse {
+  redditPublic: boolean;
+  redgifsPublic: boolean;
+  instagramPublic: boolean;
+  instagramInstaloaderAvailable: boolean;
+  instagramInstaloaderVersion?: string | null;
+  instagramSessionConfigured: boolean;
+  instagramRapidApiConfigured: boolean;
+  maxBatchUrls: number;
+  maxZipItems: number;
+  maxZipVideoItems: number;
+  maxProfileLimit: number;
+}
