@@ -40,7 +40,7 @@ const PLATFORM_CONFIG: Record<
   }
 > = {
   instagram: {
-    placeholder: '@username, profile URL, post, or reel link',
+    placeholder: '@username (public or private DP), profile URL, post, or reel link',
     bulkPlaceholder:
       'https://www.instagram.com/username/\nhttps://www.instagram.com/p/...\nhttps://www.instagram.com/reel/...',
     examples: [],

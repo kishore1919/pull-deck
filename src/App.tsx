@@ -693,7 +693,22 @@ export default function App() {
           : undefined;
 
       if (data.items.length > 0) {
+        const privateDpJob =
+          data.jobs.length === 1 && data.jobs[0]?.isPrivateProfile
+            ? data.jobs[0]
+            : undefined;
+
+        if (privateDpJob) {
+          setTypeFilter('dp');
+          showToast(
+            'success',
+            privateDpJob.message || 'Private profile — HD DP ready to download.',
+          );
+          return;
+        }
+
         if (autoStreamProfileJob) {
+          setTypeFilter('all');
           const totalHint = autoStreamProfileJob.totalAvailable
             ? ` of ${autoStreamProfileJob.totalAvailable}`
             : '';
@@ -705,6 +720,7 @@ export default function App() {
           void streamRemainingPages(autoStreamProfileJob);
           return;
         }
+        setTypeFilter('all');
         showToast(
           'success',
           `Loaded ${data.items.length} ${data.items.length === 1 ? 'file' : 'files'}.`,

@@ -12,6 +12,7 @@ import {
   LayoutGrid,
   List,
   Loader2,
+  Lock,
   RotateCw,
   Search,
   Square,
@@ -28,7 +29,44 @@ import type {
 } from '../types';
 import { MediaThumbnail } from './MediaThumbnail';
 
-export type MediaTypeFilter = 'all' | 'image' | 'video';
+export type MediaTypeFilter =
+  | 'all'
+  | 'image'
+  | 'video'
+  | 'reel'
+  | 'carousel'
+  | 'dp'
+  | 'highlight'
+  | 'story';
+
+function isIgDp(item: MediaItem): boolean {
+  return item.igCategory === 'dp' || item.contentType === 'ig_dp';
+}
+
+function isIgHighlight(item: MediaItem): boolean {
+  return item.igCategory === 'highlight' || item.contentType === 'ig_highlight';
+}
+
+function isIgStory(item: MediaItem): boolean {
+  return item.igCategory === 'story' || item.contentType === 'ig_story';
+}
+
+function isIgReel(item: MediaItem): boolean {
+  return item.igCategory === 'reel' || item.contentType === 'ig_reel';
+}
+
+function isIgCarousel(item: MediaItem): boolean {
+  return item.groupSize > 1;
+}
+
+function isIgPhoto(item: MediaItem): boolean {
+  return (
+    item.mediaType === 'image' &&
+    !isIgDp(item) &&
+    !isIgHighlight(item) &&
+    !isIgStory(item)
+  );
+}
 
 const PAGE_RENDER_SIZE = 60;
 
@@ -101,12 +139,14 @@ function formatByteSize(bytes?: number): string {
 
 function formatContentLabel(item: MediaItem): string {
   if (item.platform === 'instagram') {
-    if (item.contentType === 'ig_story') return 'Story';
-    if (item.contentType === 'ig_highlight') return 'Highlight';
-    if (item.contentType === 'ig_reel') return 'Reel';
-    return item.groupSize > 1
-      ? `Slide ${item.indexInGroup}/${item.groupSize}`
-      : 'Post';
+    if (isIgDp(item)) return 'HD DP';
+    if (isIgHighlight(item)) return 'Highlight Cover';
+    if (isIgStory(item)) return 'Story';
+    if (isIgReel(item)) return 'Reel';
+    if (item.groupSize > 1) {
+      return `Slide ${item.indexInGroup}/${item.groupSize}`;
+    }
+    return item.mediaType === 'video' ? 'Video' : 'Photo';
   }
   if (item.platform === 'redgifs') {
     return 'HD MP4';
@@ -164,8 +204,18 @@ export function StagingDeck({
   const normalizedQuery = searchQuery.trim().toLowerCase();
 
   const filteredItems = items.filter((item) => {
-    if (typeFilter === 'image' && item.mediaType !== 'image') return false;
-    if (typeFilter === 'video' && item.mediaType !== 'video') return false;
+    if (platform === 'instagram') {
+      if (typeFilter === 'image' && !isIgPhoto(item)) return false;
+      if (typeFilter === 'video' && item.mediaType !== 'video') return false;
+      if (typeFilter === 'reel' && !isIgReel(item)) return false;
+      if (typeFilter === 'carousel' && !isIgCarousel(item)) return false;
+      if (typeFilter === 'dp' && !isIgDp(item)) return false;
+      if (typeFilter === 'highlight' && !isIgHighlight(item)) return false;
+      if (typeFilter === 'story' && !isIgStory(item)) return false;
+    } else {
+      if (typeFilter === 'image' && item.mediaType !== 'image') return false;
+      if (typeFilter === 'video' && item.mediaType !== 'video') return false;
+    }
 
     if (normalizedQuery) {
       const haystack =
@@ -187,9 +237,42 @@ export function StagingDeck({
     setRenderPage(1);
   }, [platform, typeFilter, searchQuery]);
 
-  const imageCount = items.filter((i) => i.mediaType === 'image').length;
+  const imageCount =
+    platform === 'instagram'
+      ? items.filter(isIgPhoto).length
+      : items.filter((i) => i.mediaType === 'image').length;
   const videoCount = items.filter((i) => i.mediaType === 'video').length;
+  const reelCount = platform === 'instagram' ? items.filter(isIgReel).length : 0;
+  const carouselCount =
+    platform === 'instagram' ? items.filter(isIgCarousel).length : 0;
+  const dpCount = platform === 'instagram' ? items.filter(isIgDp).length : 0;
+  const highlightCount =
+    platform === 'instagram' ? items.filter(isIgHighlight).length : 0;
+  const storyCount =
+    platform === 'instagram' ? items.filter(isIgStory).length : 0;
   const showTypeTabs = imageCount > 0 && videoCount > 0;
+
+  const instagramTabs: Array<{
+    key: MediaTypeFilter;
+    label: string;
+    count: number;
+  }> = [
+    { key: 'all', label: 'All', count: items.length },
+    { key: 'image', label: 'Photos', count: imageCount },
+    { key: 'video', label: 'Videos', count: videoCount },
+    { key: 'reel', label: 'Reels', count: reelCount },
+    { key: 'carousel', label: 'Carousels', count: carouselCount },
+    { key: 'dp', label: 'DP', count: dpCount },
+    { key: 'highlight', label: 'Highlights', count: highlightCount },
+    { key: 'story', label: 'Stories', count: storyCount },
+  ];
+
+  const privateProfileJobs = jobs.filter(
+    (j) =>
+      j.platform === 'instagram' &&
+      j.status === 'ready' &&
+      Boolean(j.isPrivateProfile),
+  );
 
   const issueJobs = jobs.filter(
     (j) => j.status === 'auth_required' || j.status === 'error',
@@ -352,8 +435,40 @@ export function StagingDeck({
 
           {/* Secondary Filter / Duplicate Toggle / Search / View Row */}
           <div className="flex flex-wrap items-center justify-between gap-2.5">
-            <div className="flex flex-wrap items-center gap-3">
-              {showTypeTabs ? (
+            <div className="flex flex-wrap items-center gap-3 min-w-0 max-w-full">
+              {platform === 'instagram' ? (
+                <div
+                  role="tablist"
+                  aria-label="Filter Instagram media by category"
+                  className="inline-flex items-center p-0.5 bg-[#F4F4F5] dark:bg-[#18181B] rounded-lg overflow-x-auto max-w-full"
+                >
+                  {instagramTabs.map((tab) => {
+                    const isActive = typeFilter === tab.key;
+                    const isEmpty = tab.count === 0;
+                    return (
+                      <button
+                        key={tab.key}
+                        type="button"
+                        role="tab"
+                        aria-selected={isActive}
+                        onClick={() => onTypeFilterChange(tab.key)}
+                        className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${
+                          isActive
+                            ? 'bg-white dark:bg-[#27272A] text-[#09090B] dark:text-[#FAFAFA] shadow-xs'
+                            : isEmpty
+                              ? 'text-[#A1A1AA] dark:text-[#71717A] hover:text-[#52525B] dark:hover:text-[#D4D4D8]'
+                              : 'text-[#52525B] dark:text-[#A1A1AA] hover:text-[#09090B] dark:hover:text-[#FAFAFA]'
+                        }`}
+                      >
+                        <span>{tab.label}</span>
+                        <span className="font-mono tabular-nums text-[11px] opacity-80">
+                          {tab.count}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : showTypeTabs ? (
                 <div
                   role="tablist"
                   aria-label="Filter by media type"
@@ -563,6 +678,30 @@ export function StagingDeck({
 
       {/* Main Content */}
       <div className="p-4 sm:p-5 flex flex-col gap-5">
+        {/* Private Profile HD DP Notice */}
+        {platform === 'instagram' && privateProfileJobs.length > 0 && (
+          <div className="rounded-lg border border-[#E4E4E7] dark:border-[#27272A] bg-[#FAFAFA] dark:bg-[#18181B]/70 px-3.5 py-2.5 flex items-start gap-2.5 text-xs">
+            <Lock
+              className="w-3.5 h-3.5 text-[#52525B] dark:text-[#A1A1AA] shrink-0 mt-0.5"
+              aria-hidden="true"
+            />
+            <div className="space-y-1 text-[#52525B] dark:text-[#A1A1AA] leading-relaxed">
+              {privateProfileJobs.map((job) => (
+                <p key={job.id}>{job.message}</p>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Highlight Covers Zero-Login Note */}
+        {platform === 'instagram' &&
+          typeFilter === 'highlight' &&
+          filteredItems.length > 0 && (
+            <p className="text-xs text-[#71717A] dark:text-[#A1A1AA]">
+              Highlight cover images download without login. Individual slides inside highlights require an Instagram login.
+            </p>
+          )}
+
         {/* Loading Skeleton */}
         {isExtracting && items.length === 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -583,20 +722,75 @@ export function StagingDeck({
 
         {/* No Filter Matches */}
         {!isExtracting && items.length > 0 && filteredItems.length === 0 && (
-          <div className="py-10 text-center">
-            <p className="text-sm text-[#52525B] dark:text-[#A1A1AA]">
-              No matching files.
-            </p>
-            <button
-              type="button"
-              onClick={() => {
-                onTypeFilterChange('all');
-                onSearchQueryChange('');
-              }}
-              className="mt-2 text-xs font-medium text-[#1D4ED8] dark:text-[#60A5FA] hover:underline underline-offset-2"
-            >
-              Reset filter
-            </button>
+          <div className="py-10 px-4 text-center max-w-md mx-auto">
+            {platform === 'instagram' && !normalizedQuery && typeFilter === 'story' ? (
+              <>
+                <p className="text-sm font-medium text-[#09090B] dark:text-[#FAFAFA]">
+                  Active Stories require Instagram login
+                </p>
+                <p className="mt-1.5 text-xs text-[#52525B] dark:text-[#A1A1AA] leading-relaxed">
+                  Instagram hides active 24-hour Stories from logged-out requests. PullDeck stays strictly zero-login and zero-cookie.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => onTypeFilterChange('all')}
+                  className="mt-3 text-xs font-medium text-[#1D4ED8] dark:text-[#60A5FA] hover:underline underline-offset-2"
+                >
+                  View all loaded files
+                </button>
+              </>
+            ) : platform === 'instagram' &&
+              !normalizedQuery &&
+              privateProfileJobs.length > 0 &&
+              typeFilter !== 'dp' &&
+              dpCount > 0 ? (
+              <>
+                <p className="text-sm font-medium text-[#09090B] dark:text-[#FAFAFA]">
+                  Private profile content is hidden by Instagram
+                </p>
+                <p className="mt-1.5 text-xs text-[#52525B] dark:text-[#A1A1AA] leading-relaxed">
+                  Posts, reels, carousels, highlights, and stories are locked on private accounts, but the full HD profile picture (DP) is ready.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => onTypeFilterChange('dp')}
+                  className="mt-3 text-xs font-medium text-[#1D4ED8] dark:text-[#60A5FA] hover:underline underline-offset-2"
+                >
+                  View HD DP ({dpCount})
+                </button>
+              </>
+            ) : platform === 'instagram' &&
+              !normalizedQuery &&
+              typeFilter === 'highlight' ? (
+              <>
+                <p className="text-sm text-[#52525B] dark:text-[#A1A1AA]">
+                  No public Highlights found on this profile.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => onTypeFilterChange('all')}
+                  className="mt-2 text-xs font-medium text-[#1D4ED8] dark:text-[#60A5FA] hover:underline underline-offset-2"
+                >
+                  View all loaded files
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-[#52525B] dark:text-[#A1A1AA]">
+                  No matching files.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onTypeFilterChange('all');
+                    onSearchQueryChange('');
+                  }}
+                  className="mt-2 text-xs font-medium text-[#1D4ED8] dark:text-[#60A5FA] hover:underline underline-offset-2"
+                >
+                  Reset filter
+                </button>
+              </>
+            )}
           </div>
         )}
 

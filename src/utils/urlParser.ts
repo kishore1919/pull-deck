@@ -47,9 +47,10 @@ const IG_RESERVED_PATHS = new Set([
 ]);
 
 export const CONTENT_TYPE_LABELS: Record<ContentType, string> = {
-  ig_profile: 'Instagram Public Profile',
+  ig_profile: 'Instagram Profile',
   ig_post: 'Instagram Post',
   ig_reel: 'Instagram Reel',
+  ig_dp: 'Instagram Profile Picture (DP)',
   ig_story: 'Instagram Story',
   ig_highlight: 'Instagram Highlight',
   reddit_post: 'Reddit Post',
@@ -151,7 +152,7 @@ export function classifyUrl(rawInput: string): ParsedUrlEntry {
     } else if (/^\/[^/]+\/reel\/[^/]+/i.test(pathname)) {
       contentType = 'ig_reel';
     } else {
-      const profileMatch = pathname.match(/^\/([a-zA-Z0-9._]{1,30})(\/(reels|tagged))?$/i);
+      const profileMatch = pathname.match(/^\/([a-zA-Z0-9._]{1,30})(\/(reels|tagged|videos))?$/i);
       if (profileMatch && !IG_RESERVED_PATHS.has(profileMatch[1].toLowerCase())) {
         contentType = 'ig_profile';
       }

@@ -1,5 +1,10 @@
 import crypto from 'node:crypto';
-import type { ContentType, ExtractionJob, MediaItem } from '../../src/types.ts';
+import type {
+  ContentType,
+  ExtractionJob,
+  InstagramCategory,
+  MediaItem,
+} from '../../src/types.ts';
 import { sanitizeFilename } from '../security.ts';
 import { runInstaloaderWorker } from './instaloaderBridge.ts';
 
@@ -29,7 +34,7 @@ function parseInstagramPath(rawUrl: string): ParsedInstagramPath {
     return { shortcode: postMatch[1] };
   }
 
-  const profileMatch = path.match(/^\/([a-zA-Z0-9._]{1,30})(?:\/(?:reels|tagged))?$/i);
+  const profileMatch = path.match(/^\/([a-zA-Z0-9._]{1,30})(?:\/(?:reels|tagged|videos))?$/i);
   if (profileMatch) {
     return { username: profileMatch[1] };
   }
@@ -53,16 +58,42 @@ function makeIgItem(params: {
   durationSec?: number;
   shortcodeOrId: string;
   createdAt?: string;
+  igCategory?: InstagramCategory;
 }): MediaItem {
   const ext = params.mediaType === 'video' ? 'mp4' : 'jpg';
   const cleanUser = params.username.replace(/^@/, '') || 'instagram';
   const suffix = params.total > 1 ? `_${String(params.index).padStart(2, '0')}` : '';
 
+  const resolvedCategory: InstagramCategory =
+    params.igCategory ||
+    (params.contentType === 'ig_dp'
+      ? 'dp'
+      : params.contentType === 'ig_highlight'
+        ? 'highlight'
+        : params.contentType === 'ig_story'
+          ? 'story'
+          : params.contentType === 'ig_reel'
+            ? 'reel'
+            : params.mediaType === 'video'
+              ? 'video'
+              : 'photo');
+
+  const itemContentType: ContentType =
+    resolvedCategory === 'dp'
+      ? 'ig_dp'
+      : resolvedCategory === 'highlight'
+        ? 'ig_highlight'
+        : resolvedCategory === 'story'
+          ? 'ig_story'
+          : resolvedCategory === 'reel'
+            ? 'ig_reel'
+            : params.contentType;
+
   return {
     id: crypto.randomUUID(),
     jobId: params.jobId,
     platform: 'instagram',
-    contentType: params.contentType,
+    contentType: itemContentType,
     mediaType: params.mediaType,
     title: params.title || `Instagram ${params.shortcodeOrId}`,
     author: `@${cleanUser}`,
@@ -78,6 +109,7 @@ function makeIgItem(params: {
     indexInGroup: params.index,
     groupSize: params.total,
     createdAt: params.createdAt,
+    igCategory: resolvedCategory,
   };
 }
 
@@ -97,9 +129,10 @@ export async function extractInstagramUrl(
   const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 100);
   const parsed = parseInstagramPath(sourceUrl);
   const labelMap: Record<ContentType, string> = {
-    ig_profile: 'Instagram Public Profile',
+    ig_profile: 'Instagram Profile',
     ig_post: 'Instagram Post',
     ig_reel: 'Instagram Reel',
+    ig_dp: 'Instagram Profile Picture (DP)',
     ig_story: 'Instagram Story',
     ig_highlight: 'Instagram Highlight',
     reddit_post: 'Reddit Post',
@@ -173,6 +206,7 @@ export async function extractInstagramUrl(
           typeof entry.durationSec === 'number' ? entry.durationSec : undefined,
         shortcodeOrId: entry.shortcodeOrId || parsed.shortcode || parsed.username || 'ig',
         createdAt: entry.createdAt || undefined,
+        igCategory: entry.igCategory || undefined,
       }),
     );
 
@@ -183,8 +217,11 @@ export async function extractInstagramUrl(
           ? `ig_loader:${workerResult.nextOffset}`
           : undefined;
 
-    const resolvedLabel =
-      (contentType === 'ig_post' || contentType === 'ig_reel') && items.length > 1
+    const isPrivateProfile = Boolean(workerResult.private);
+
+    const resolvedLabel = isPrivateProfile
+      ? 'Private Profile · HD DP'
+      : (contentType === 'ig_post' || contentType === 'ig_reel') && items.length > 1
         ? 'Instagram Carousel'
         : contentLabel;
 
@@ -200,13 +237,16 @@ export async function extractInstagramUrl(
         contentType,
         contentLabel: resolvedLabel,
         status: 'ready',
-        message: `Extracted ${items.length} media ${items.length === 1 ? 'file' : 'files'} via Instaloader${partialSuffix}.`,
+        message:
+          workerResult.notice ||
+          `Extracted ${items.length} media ${items.length === 1 ? 'file' : 'files'} via Instaloader${partialSuffix}.`,
         itemCount: items.length,
         totalAvailable:
           typeof workerResult.totalAvailable === 'number'
             ? workerResult.totalAvailable
             : undefined,
         resolverUsed: 'Python Instaloader',
+        isPrivateProfile,
         hasMore: Boolean(workerResult.hasMore && nextCursor),
         nextCursor,
         pageNumber,

@@ -32,6 +32,7 @@ export interface InstaloaderRawItem {
   height?: number | null;
   durationSec?: number | null;
   createdAt?: string | null;
+  igCategory?: 'photo' | 'video' | 'reel' | 'dp' | 'highlight' | 'story' | null;
 }
 
 export interface InstaloaderWorkerResult {
@@ -41,6 +42,8 @@ export interface InstaloaderWorkerResult {
   nextCursor?: string | null;
   nextOffset?: number | null;
   totalAvailable?: number | null;
+  private?: boolean;
+  notice?: string | null;
   rateLimited?: boolean;
   partial?: boolean;
   strategyUsed?: string | null;

@@ -4,6 +4,7 @@ export type ContentType =
   | 'ig_profile'
   | 'ig_post'
   | 'ig_reel'
+  | 'ig_dp'
   | 'ig_story'
   | 'ig_highlight'
   | 'reddit_post'
@@ -12,6 +13,14 @@ export type ContentType =
   | 'redgifs_clip'
   | 'redgifs_profile'
   | 'unknown';
+
+export type InstagramCategory =
+  | 'photo'
+  | 'video'
+  | 'reel'
+  | 'dp'
+  | 'highlight'
+  | 'story';
 
 export type MediaType = 'image' | 'video';
 
@@ -65,6 +74,7 @@ export interface MediaItem {
   postId?: string;
   crosspostRootId?: string;
   canonicalMediaKey?: string;
+  igCategory?: InstagramCategory;
 }
 
 export interface ExtractionJob {
@@ -79,6 +89,7 @@ export interface ExtractionJob {
   totalAvailable?: number;
   resolverUsed?: string;
   authHint?: string;
+  isPrivateProfile?: boolean;
   hasMore?: boolean;
   nextCursor?: string;
   pageNumber?: number;

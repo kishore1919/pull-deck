@@ -39,6 +39,7 @@ SHORTCODE_RE = re.compile(r"^[a-zA-Z0-9_-]{4,40}$")
 MAX_CURSOR_DECOMPRESSED_BYTES = 128 * 1024
 POLARIS_PROFILE_POSTS_DOC_ID = "29483846714553007"
 POLARIS_PROFILE_ROOT_DOC_ID = "27981003384861049"
+POLARIS_USER_INFO_DOC_ID = "27937681195819736"
 POLARIS_PROFILE_DOC_ID = "28904005159232689"
 POLARIS_POST_ROOT_DOC_ID = "28891146940585796"
 
@@ -406,6 +407,9 @@ def serialize_structured_media_node(
     dur = node.get("video_duration")
     width = vid_w or img_w or node.get("original_width") or dims.get("width")
     height = vid_h or img_h or node.get("original_height") or dims.get("height")
+    product_type = str(node.get("product_type") or "").lower()
+    is_reel = product_type == "clips"
+    ig_category = "reel" if is_reel else ("video" if is_video else "photo")
 
     items.append(
         {
@@ -413,15 +417,16 @@ def serialize_structured_media_node(
             "mediaUrl": str(media_url),
             "thumbnailUrl": str(thumb_url),
             "username": str(username),
-            "title": title or f"Instagram {'Reel' if is_video else 'Post'} ({shortcode})",
+            "title": title or f"Instagram {'Reel' if is_reel else ('Video' if is_video else 'Post')} ({shortcode})",
             "shortcodeOrId": str(shortcode),
-            "sourceUrl": post_url,
+            "sourceUrl": f"https://www.instagram.com/reel/{shortcode}/" if is_reel and shortcode else post_url,
             "index": 1,
             "total": 1,
             "width": width if isinstance(width, int) else None,
             "height": height if isinstance(height, int) else None,
             "durationSec": round(dur) if isinstance(dur, (int, float)) else None,
             "createdAt": created_at,
+            "igCategory": ig_category,
         }
     )
     return items
@@ -833,6 +838,10 @@ def extract_post(
         loader, shortcode, source_url, media_id=media_id
     )
     if polaris_items:
+        if content_type == "ig_reel":
+            for it in polaris_items:
+                if it.get("mediaType") == "video":
+                    it["igCategory"] = "reel"
         return {
             "ok": True,
             "items": polaris_items,
@@ -955,6 +964,7 @@ def compact_edge_for_cursor(edge: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "pk": node.get("pk"),
         "code": node.get("code") or node.get("shortcode"),
         "media_type": node.get("media_type"),
+        "product_type": node.get("product_type"),
         "display_uri": node.get("display_uri") or node.get("display_url"),
     }
     if isinstance(node.get("carousel_media_count"), int):
@@ -962,6 +972,123 @@ def compact_edge_for_cursor(edge: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if cap_text:
         compact_node["caption"] = {"text": cap_text[:140]}
     return {"node": compact_node}
+
+
+def fetch_hd_profile_dp_item(
+    loader: instaloader.Instaloader,
+    username: str,
+    pk: Optional[str],
+    fallback_pic_url: Optional[str] = None,
+    full_name: Optional[str] = None,
+    is_private: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch full-resolution uncropped HD profile picture (DP) via Instaloader's
+    logged-out user-info query (doc_id 27937681195819736). Works on BOTH public
+    and private profiles without login or cookies.
+    """
+    best_url = fallback_pic_url if isinstance(fallback_pic_url, str) and fallback_pic_url.startswith("http") else None
+    best_w: Optional[int] = None
+    best_h: Optional[int] = None
+
+    if pk:
+        try:
+            hd_resp = loader.context.doc_id_graphql_query(
+                POLARIS_USER_INFO_DOC_ID,
+                {
+                    "id": str(pk),
+                    "render_surface": "PROFILE",
+                    "__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider": True,
+                    "__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider": False,
+                    "__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider": False,
+                    "__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider": False,
+                    "enable_integrity_filters": True,
+                },
+                referer=f"https://www.instagram.com/{username}/",
+                web_api=True,
+            )
+            hd_user = ((hd_resp or {}).get("data") or {}).get("user") or {}
+            if isinstance(hd_user, dict):
+                hd_info = hd_user.get("hd_profile_pic_url_info")
+                if isinstance(hd_info, dict) and isinstance(hd_info.get("url"), str) and hd_info["url"].startswith("http"):
+                    best_url = hd_info["url"]
+                    if isinstance(hd_info.get("width"), int):
+                        best_w = hd_info["width"]
+                    if isinstance(hd_info.get("height"), int):
+                        best_h = hd_info["height"]
+                elif isinstance(hd_user.get("hd_profile_pic_versions"), list):
+                    v_url, v_w, v_h = pick_best_candidate(hd_user["hd_profile_pic_versions"])
+                    if v_url:
+                        best_url, best_w, best_h = v_url, v_w, v_h
+                if not best_url and isinstance(hd_user.get("profile_pic_url"), str) and hd_user["profile_pic_url"].startswith("http"):
+                    best_url = hd_user["profile_pic_url"]
+        except Exception:
+            pass
+
+    if not best_url:
+        return None
+
+    display_label = f"{full_name} (@{username})" if full_name and full_name.strip() else f"@{username}"
+    privacy_tag = "Private Profile · " if is_private else ""
+    return {
+        "mediaType": "image",
+        "mediaUrl": best_url,
+        "thumbnailUrl": best_url,
+        "username": username,
+        "title": f"{privacy_tag}{display_label} — HD Profile Picture (DP)",
+        "shortcodeOrId": "dp_hd",
+        "sourceUrl": f"https://www.instagram.com/{username}/",
+        "index": 1,
+        "total": 1,
+        "width": best_w,
+        "height": best_h,
+        "igCategory": "dp",
+    }
+
+
+def extract_highlight_cover_items(
+    root_user: Dict[str, Any],
+    username: str,
+) -> List[Dict[str, Any]]:
+    """
+    Extract public Highlight tray covers from lox_highlights_connection.
+    (Instagram requires an authenticated login for full highlight slides, while
+    highlight tray metadata and cover artwork are available logged-out.)
+    """
+    conn = root_user.get("lox_highlights_connection")
+    edges = conn.get("edges") if isinstance(conn, dict) else None
+    if not isinstance(edges, list) or not edges:
+        return []
+
+    items: List[Dict[str, Any]] = []
+    for idx, edge in enumerate(edges, start=1):
+        node = edge.get("node") if isinstance(edge, dict) else None
+        if not isinstance(node, dict):
+            continue
+        hl_id = str(node.get("id") or "").strip()
+        cover_url = node.get("cover_media_cropped_thumbnail_url")
+        if not isinstance(cover_url, str) or not cover_url.startswith("http"):
+            continue
+        raw_title = clean_caption(node.get("title"), f"Highlight #{idx}")
+        items.append(
+            {
+                "mediaType": "image",
+                "mediaUrl": cover_url,
+                "thumbnailUrl": cover_url,
+                "username": username,
+                "title": f"Highlight · {raw_title}",
+                "shortcodeOrId": f"highlight_{hl_id or idx}",
+                "sourceUrl": (
+                    f"https://www.instagram.com/stories/highlights/{hl_id}/"
+                    if hl_id
+                    else f"https://www.instagram.com/{username}/"
+                ),
+                "index": idx,
+                "total": 1,
+                "igCategory": "highlight",
+            }
+        )
+    return items
 
 
 def serialize_polaris_timeline_edges(
@@ -989,6 +1116,8 @@ def serialize_polaris_timeline_edges(
 
         shortcode = str(node.get("code") or node.get("shortcode") or "")
         media_id = str(node.get("pk")) if node.get("pk") else None
+        product_type = str(node.get("product_type") or "").lower()
+        is_reel_node = product_type == "clips"
         within_budget = (time.monotonic() - hydration_started_at) < max_hydration_seconds
 
         if (
@@ -1001,16 +1130,19 @@ def serialize_polaris_timeline_edges(
             if hydrated_count > 0:
                 time.sleep(random.uniform(0.05, 0.14))
             hydrated_count += 1
-            media_type = node.get("media_type")
-            ct = "ig_reel" if media_type == 2 else "ig_post"
+            ct = "ig_reel" if is_reel_node else "ig_post"
             hydrated = extract_post(
                 loader,
                 shortcode,
-                f"https://www.instagram.com/p/{shortcode}/",
+                f"https://www.instagram.com/{'reel' if is_reel_node else 'p'}/{shortcode}/",
                 ct,
                 media_id=media_id,
             )
             if hydrated.get("ok") and hydrated.get("items"):
+                if is_reel_node:
+                    for hi in hydrated["items"]:
+                        if hi.get("mediaType") == "video":
+                            hi["igCategory"] = "reel"
                 items.extend(hydrated["items"])
                 continue
             if hydrated.get("rateLimited"):
@@ -1023,6 +1155,10 @@ def serialize_polaris_timeline_edges(
             fallback_shortcode=shortcode or username,
             default_source_url=source_url,
         )
+        if is_reel_node:
+            for di in direct_items:
+                if not di.get("igCategory"):
+                    di["igCategory"] = "reel"
         items.extend(direct_items)
 
     return items, hydration_throttled
@@ -1033,14 +1169,87 @@ def fetch_polaris_profile_initial(
     username: str,
 ) -> Dict[str, Any]:
     """
-    Fetch initial public profile timeline via Instaloader's logged-out Polaris GraphQL
-    (29483846714553007 + 27981003384861049 on api/graphql), automatically falling back
-    to Instaloader's get_page_data(f"{username}/") if needed.
+    Fetch initial profile metadata (HD DP + Highlights + private flag) and public
+    timeline via Instaloader's logged-out Polaris GraphQL (27981003384861049 +
+    27937681195819736 + 29483846714553007), automatically falling back to
+    Instaloader's get_page_data(f"{username}/") if needed.
+    For private profiles, returns ok=True with the full HD DP ready to download.
     """
     referer = f"https://www.instagram.com/{username}/"
     gql_rate_limited = False
+    root_user: Optional[Dict[str, Any]] = None
+    profile_extras: List[Dict[str, Any]] = []
 
-    # 1a. Logged-out Polaris GraphQL timeline query (works on datacenter & residential IPs!)
+    # Step 1: Query profile root (27981003384861049) for pk, is_private, HD DP, and Highlights
+    try:
+        root_resp = loader.context.doc_id_graphql_query(
+            POLARIS_PROFILE_ROOT_DOC_ID,
+            {
+                "username": username,
+                "__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider": False,
+            },
+            referer=referer,
+            web_api=True,
+        )
+        if isinstance(root_resp, dict):
+            data_obj = root_resp.get("data")
+            if isinstance(data_obj, dict) and "xig_user_by_username" in data_obj:
+                if data_obj["xig_user_by_username"] is None:
+                    return {
+                        "ok": False,
+                        "notFound": True,
+                        "error": f"Instagram profile @{username} was not found.",
+                    }
+                if isinstance(data_obj["xig_user_by_username"], dict):
+                    root_user = data_obj["xig_user_by_username"]
+    except (ig_exc.TooManyRequestsException, ig_exc.LoginRequiredException):
+        gql_rate_limited = True
+    except Exception:
+        pass
+
+    if isinstance(root_user, dict):
+        is_private = bool(root_user.get("is_private"))
+        pk = str(root_user.get("pk") or "") or None
+        full_name = str(root_user.get("full_name") or "").strip() or None
+        dp_item = fetch_hd_profile_dp_item(
+            loader,
+            username,
+            pk=pk,
+            fallback_pic_url=root_user.get("profile_pic_url"),
+            full_name=full_name,
+            is_private=is_private,
+        )
+        if dp_item:
+            profile_extras.append(dp_item)
+
+        # Private profile: return the HD DP cleanly so the user can download it!
+        if is_private:
+            if dp_item:
+                return {
+                    "ok": True,
+                    "private": True,
+                    "privateDpOnly": True,
+                    "items": [dp_item],
+                    "hasMore": False,
+                    "nextCursor": None,
+                    "totalAvailable": 1,
+                    "postsFetched": 0,
+                    "strategy": "instaloader_polaris_private_dp",
+                    "notice": (
+                        f"@{username} is a private account — posts, reels, highlights, and stories "
+                        "are hidden by Instagram, but the full HD profile picture (DP) is ready to download."
+                    ),
+                }
+            return {
+                "ok": False,
+                "private": True,
+                "error": f"@{username} is a private Instagram account and no profile picture was returned.",
+            }
+
+        # Public profile: collect Highlight tray covers too
+        profile_extras.extend(extract_highlight_cover_items(root_user, username))
+
+    # Step 2: Logged-out Polaris GraphQL timeline query (works on datacenter & residential IPs!)
     try:
         resp = loader.context.doc_id_graphql_query(
             POLARIS_PROFILE_POSTS_DOC_ID,
@@ -1064,88 +1273,72 @@ def fetch_polaris_profile_initial(
                 raw_edges = conn.get("edges") if isinstance(conn, dict) else None
                 page_info = (conn.get("page_info") or {}) if isinstance(conn, dict) else {}
                 total_posts: Optional[int] = conn.get("count") if isinstance(conn.get("count"), int) else None
+                if isinstance(root_user, dict) and isinstance(root_user.get("all_media_count"), int):
+                    total_posts = root_user["all_media_count"]
 
-                # Query lightweight profile root for total media count / private status
-                is_private = False
-                try:
-                    root_resp = loader.context.doc_id_graphql_query(
-                        POLARIS_PROFILE_ROOT_DOC_ID,
-                        {
-                            "username": username,
-                            "__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider": False,
-                        },
-                        referer=referer,
-                        web_api=True,
-                    )
-                    root_user = ((root_resp or {}).get("data") or {}).get("xig_user_by_username") or {}
-                    if isinstance(root_user, dict):
-                        is_private = bool(root_user.get("is_private"))
-                        if isinstance(root_user.get("all_media_count"), int):
-                            total_posts = root_user["all_media_count"]
-                except Exception:
-                    pass
-
-                if is_private:
-                    return {
-                        "ok": False,
-                        "private": True,
-                        "error": f"@{username} is a private Instagram account.",
-                    }
-
-                if isinstance(raw_edges, list) and len(raw_edges) > 0:
+                if (isinstance(raw_edges, list) and len(raw_edges) > 0) or profile_extras:
                     return {
                         "ok": True,
-                        "pageId": str(user_node.get("id") or ""),
-                        "edges": raw_edges,
+                        "pageId": str(user_node.get("id") or (root_user or {}).get("id") or ""),
+                        "edges": raw_edges if isinstance(raw_edges, list) else [],
+                        "profileExtras": profile_extras,
                         "hasNextPage": bool(page_info.get("has_next_page")),
                         "endCursor": page_info.get("end_cursor") or None,
                         "totalPosts": total_posts,
                         "strategy": "instaloader_polaris_graphql",
                     }
-            elif resp.get("data") is not None and "xig_user_by_username" in (resp.get("data") or {}):
-                # Explicitly null xig_user_by_username -> verify via profile root
-                try:
-                    root_resp = loader.context.doc_id_graphql_query(
-                        POLARIS_PROFILE_ROOT_DOC_ID,
-                        {
-                            "username": username,
-                            "__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider": False,
-                        },
-                        referer=referer,
-                        web_api=True,
-                    )
-                    root_user = ((root_resp or {}).get("data") or {}).get("xig_user_by_username")
-                    if root_user is None:
-                        return {
-                            "ok": False,
-                            "notFound": True,
-                            "error": f"Instagram profile @{username} was not found.",
-                        }
-                    if isinstance(root_user, dict) and root_user.get("is_private"):
-                        return {
-                            "ok": False,
-                            "private": True,
-                            "error": f"@{username} is a private Instagram account.",
-                        }
-                except Exception:
-                    pass
     except (ig_exc.TooManyRequestsException, ig_exc.LoginRequiredException):
         gql_rate_limited = True
     except Exception:
         pass
 
-    # 1b. Automatic fallback: Instaloader 4.16 logged-out HTML page-data parser
-    page_blocks = loader.context.get_page_data(f"{username}/")
-    if any(
-        isinstance(block, dict)
-        and (block.get("xig_user_by_username") or {}).get("is_private")
-        for block in page_blocks
-    ):
+    # If we at least got HD DP / Highlights from root_user, return them gracefully
+    if profile_extras:
         return {
-            "ok": False,
-            "private": True,
-            "error": f"@{username} is a private Instagram account.",
+            "ok": True,
+            "pageId": str((root_user or {}).get("id") or ""),
+            "edges": [],
+            "profileExtras": profile_extras,
+            "hasNextPage": False,
+            "endCursor": None,
+            "totalPosts": None,
+            "strategy": "instaloader_polaris_graphql",
         }
+
+    # Step 3: Automatic fallback — Instaloader 4.16 logged-out HTML page-data parser
+    page_blocks = loader.context.get_page_data(f"{username}/")
+    for block in page_blocks:
+        u_blk = block.get("xig_user_by_username") if isinstance(block, dict) else None
+        if isinstance(u_blk, dict) and u_blk.get("is_private"):
+            dp_item = fetch_hd_profile_dp_item(
+                loader,
+                username,
+                pk=str(u_blk.get("pk") or "") or None,
+                fallback_pic_url=u_blk.get("profile_pic_url"),
+                full_name=str(u_blk.get("full_name") or "").strip() or None,
+                is_private=True,
+            )
+            if dp_item:
+                return {
+                    "ok": True,
+                    "private": True,
+                    "privateDpOnly": True,
+                    "items": [dp_item],
+                    "hasMore": False,
+                    "nextCursor": None,
+                    "totalAvailable": 1,
+                    "postsFetched": 0,
+                    "strategy": "instaloader_polaris_private_dp",
+                    "notice": (
+                        f"@{username} is a private account — posts, reels, highlights, and stories "
+                        "are hidden by Instagram, but the full HD profile picture (DP) is ready to download."
+                    ),
+                }
+            return {
+                "ok": False,
+                "private": True,
+                "error": f"@{username} is a private Instagram account.",
+            }
 
     user_node = next(
         (
@@ -1170,6 +1363,7 @@ def fetch_polaris_profile_initial(
         "ok": True,
         "pageId": str(user_node.get("id") or ""),
         "edges": conn.get("edges") if isinstance(conn.get("edges"), list) else [],
+        "profileExtras": [],
         "hasNextPage": bool(page_info.get("has_next_page")),
         "endCursor": page_info.get("end_cursor") or None,
         "totalPosts": conn.get("count") if isinstance(conn.get("count"), int) else None,
@@ -1186,12 +1380,13 @@ def extract_profile_polaris(
 ) -> Dict[str, Any]:
     """
     Layer 1 Profile Engine: Uses Instaloader 4.16's logged-out Polaris GraphQL
-    (29483846714553007 / 28904005159232689) and get_page_data fallback WITHOUT
-    calling the rate-limited web_profile_info endpoint, with lossless buffered pagination.
+    (27981003384861049 / 27937681195819736 / 29483846714553007 / 28904005159232689)
+    with HD DP (public & private profiles), Highlights, and lossless buffered pagination.
     """
     page_id: Optional[str] = None
     end_cursor: Optional[str] = None
     buffered_edges: List[Dict[str, Any]] = []
+    profile_extras: List[Dict[str, Any]] = []
     has_next_page = False
     total_posts: Optional[int] = None
     strategy_used = "instaloader_polaris_graphql"
@@ -1210,10 +1405,13 @@ def extract_profile_polaris(
             buffered_edges.extend(e for e in raw_buf if isinstance(e, dict))
     else:
         init = fetch_polaris_profile_initial(loader, username)
+        if init.get("privateDpOnly"):
+            return init
         if not init.get("ok"):
             return init
         page_id = str(init.get("pageId") or "")
         buffered_edges.extend(init.get("edges") or [])
+        profile_extras.extend(init.get("profileExtras") or [])
         has_next_page = bool(init.get("hasNextPage"))
         end_cursor = init.get("endCursor") or None
         total_posts = init.get("totalPosts")
@@ -1257,7 +1455,7 @@ def extract_profile_polaris(
             )
             if isinstance(resp, dict) and resp.get("errors"):
                 rate_limited = True
-                if collected_edges:
+                if collected_edges or profile_extras:
                     partial = True
                     break
                 err_msg = str(resp["errors"][0].get("message") or "Rate limit exceeded")
@@ -1284,24 +1482,29 @@ def extract_profile_polaris(
             end_cursor = page_info.get("end_cursor") or None
         except (ig_exc.TooManyRequestsException, ig_exc.LoginRequiredException, ig_exc.ConnectionException) as exc:
             rate_limited = True
-            if collected_edges:
+            if collected_edges or profile_extras:
                 partial = True
                 break
             return {"ok": False, "rateLimited": True, "error": str(exc)[:180]}
         except Exception as exc:
-            if collected_edges:
+            if collected_edges or profile_extras:
                 partial = True
                 break
             return {"ok": False, "error": str(exc)[:180]}
 
-    if not collected_edges:
+    if not collected_edges and not profile_extras:
         return {
             "ok": False,
             "rateLimited": rate_limited,
             "error": f"No public posts returned for @{username}.",
         }
 
-    items, _ = serialize_polaris_timeline_edges(loader, collected_edges, username, source_url)
+    timeline_items, _ = (
+        serialize_polaris_timeline_edges(loader, collected_edges, username, source_url)
+        if collected_edges
+        else ([], False)
+    )
+    items = [*profile_extras, *timeline_items]
     next_cursor: Optional[str] = None
     compact_leftovers = [c for c in (compact_edge_for_cursor(e) for e in leftover_edges) if c is not None]
 
@@ -1349,6 +1552,29 @@ def extract_profile_classic(
     """
     profile = instaloader.Profile.from_username(loader.context, username)
     if profile.is_private:
+        dp_item = fetch_hd_profile_dp_item(
+            loader,
+            username,
+            source_url,
+            str(getattr(profile, "userid", "") or "") or None,
+            getattr(profile, "profile_pic_url", None),
+        )
+        if dp_item:
+            return {
+                "ok": True,
+                "private": True,
+                "privateDpOnly": True,
+                "items": [dp_item],
+                "hasMore": False,
+                "nextCursor": None,
+                "totalAvailable": 1,
+                "postsFetched": 0,
+                "strategyUsed": "instaloader_classic_private_dp",
+                "notice": (
+                    f"@{username} is a private account — posts, reels, highlights, and stories are hidden by Instagram, "
+                    "but the full HD profile picture (DP) is ready to download."
+                ),
+            }
         return {
             "ok": False,
             "private": True,
@@ -1405,6 +1631,17 @@ def extract_profile_classic(
                 next_cursor = f"ig_loader:{offset + len(page_posts)}"
 
     items: List[Dict[str, Any]] = []
+    if offset == 0 and not frozen_cursor:
+        dp_item = fetch_hd_profile_dp_item(
+            loader,
+            username,
+            source_url,
+            str(getattr(profile, "userid", "") or "") or None,
+            getattr(profile, "profile_pic_url", None),
+        )
+        if dp_item:
+            items.append(dp_item)
+
     for post in page_posts:
         try:
             items.extend(serialize_instaloader_post(post, source_url))
