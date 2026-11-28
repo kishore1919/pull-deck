@@ -17,12 +17,35 @@ import {
   Square,
   Trash2,
 } from 'lucide-react';
-import type { ExtractionJob, MediaItem, Platform } from '../types';
+import type {
+  DuplicateAnnotation,
+  DuplicateMatchReason,
+  ExtractionJob,
+  MediaItem,
+  Platform,
+} from '../types';
 import { MediaThumbnail } from './MediaThumbnail';
 
 export type MediaTypeFilter = 'all' | 'image' | 'video';
 
 const PAGE_RENDER_SIZE = 60;
+
+function formatShortDate(iso?: string): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+function formatDuplicateReason(reason?: DuplicateMatchReason): string {
+  if (reason === 'visual') return 'Visual match';
+  if (reason === 'title') return 'Same title';
+  return 'Exact media';
+}
 
 interface StagingDeckProps {
   platform: Platform;
@@ -42,6 +65,11 @@ interface StagingDeckProps {
   zipProgressLabel: string | null;
   zipPartCount: number;
   selectedCount: number;
+  duplicateAnnotations?: Map<string, DuplicateAnnotation>;
+  duplicateCount?: number;
+  showDuplicates?: boolean;
+  onToggleShowDuplicates?: () => void;
+  visualScanProgress?: { scanned: number; total: number } | null;
   onToggleSelect: (id: string) => void;
   onSelectVisible: (ids: string[]) => void;
   onDeselectPlatform: () => void;
@@ -93,6 +121,11 @@ export function StagingDeck({
   zipProgressLabel,
   zipPartCount,
   selectedCount,
+  duplicateAnnotations,
+  duplicateCount = 0,
+  showDuplicates = false,
+  onToggleShowDuplicates,
+  visualScanProgress,
   onToggleSelect,
   onSelectVisible,
   onDeselectPlatform,
@@ -202,6 +235,70 @@ export function StagingDeck({
                 <span>Export .txt</span>
               </button>
 
+              {paginatableJobs.length > 0 && (() => {
+                const activeJob = paginatableJobs[0];
+                const isLoadingMore = loadingMoreJobUrl === activeJob.sourceUrl;
+                const isAutoLoading = autoLoadingJobUrl === activeJob.sourceUrl;
+                const busy =
+                  isExtracting ||
+                  Boolean(loadingMoreJobUrl) ||
+                  Boolean(autoLoadingJobUrl);
+
+                return isAutoLoading ? (
+                  <div className="inline-flex items-center gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-mono tabular-nums text-[#52525B] dark:text-[#A1A1AA] px-1">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#1D4ED8] dark:text-[#60A5FA]" aria-hidden="true" />
+                      <span>
+                        {activeJob.totalAvailable
+                          ? `Loading ${activeJob.itemCount}/${activeJob.totalAvailable}`
+                          : `Loading ${activeJob.itemCount}...`}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onStopLoadAll}
+                      className="h-10 px-3.5 inline-flex items-center gap-1.5 text-xs font-medium rounded-lg border border-[#B91C1C]/40 dark:border-[#F87171]/40 bg-[#FEF2F2] dark:bg-[#450A0A]/40 text-[#B91C1C] dark:text-[#F87171] hover:bg-[#FEE2E2] dark:hover:bg-[#450A0A]/70 transition-colors whitespace-nowrap shrink-0"
+                    >
+                      <Square className="w-3 h-3 fill-current" aria-hidden="true" />
+                      <span>Stop</span>
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => onLoadMore(activeJob)}
+                      disabled={busy}
+                      className="h-10 px-3.5 inline-flex items-center gap-1.5 text-xs font-medium rounded-lg border border-[#E4E4E7] dark:border-[#27272A] bg-[#FAFAFA] dark:bg-[#18181B] text-[#09090B] dark:text-[#FAFAFA] hover:border-[#1D4ED8] dark:hover:border-[#3B82F6] hover:text-[#1D4ED8] dark:hover:text-[#60A5FA] transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
+                    >
+                      {isLoadingMore ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                          <span>Loading...</span>
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+                          <span>Load more</span>
+                        </>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onLoadAll(activeJob)}
+                      disabled={busy}
+                      className="h-10 px-3.5 inline-flex items-center gap-1.5 text-xs font-medium rounded-lg border border-[#E4E4E7] dark:border-[#27272A] bg-white dark:bg-[#111114] text-[#52525B] dark:text-[#D4D4D8] hover:border-[#1D4ED8] dark:hover:border-[#3B82F6] hover:text-[#1D4ED8] dark:hover:text-[#60A5FA] transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
+                    >
+                      <span>
+                        {activeJob.totalAvailable
+                          ? `Load all (${activeJob.totalAvailable})`
+                          : 'Load all'}
+                      </span>
+                    </button>
+                  </>
+                );
+              })()}
+
               <span className="text-xs font-mono tabular-nums text-[#71717A] dark:text-[#A1A1AA] pl-1">
                 {selectedCount}/{items.length} selected
                 {zipPartCount > 1 ? ` · ${zipPartCount} parts` : ''}
@@ -233,42 +330,70 @@ export function StagingDeck({
             </div>
           </div>
 
-          {/* Secondary Filter / Search / View Row */}
+          {/* Secondary Filter / Duplicate Toggle / Search / View Row */}
           <div className="flex flex-wrap items-center justify-between gap-2.5">
-            {showTypeTabs ? (
-              <div
-                role="tablist"
-                aria-label="Filter by media type"
-                className="inline-flex items-center p-0.5 bg-[#F4F4F5] dark:bg-[#18181B] rounded-lg"
-              >
-                {(
-                  [
-                    ['all', `All ${items.length}`],
-                    ['image', `Photos ${imageCount}`],
-                    ['video', `Videos ${videoCount}`],
-                  ] as Array<[MediaTypeFilter, string]>
-                ).map(([key, label]) => (
-                  <button
-                    key={key}
-                    type="button"
-                    role="tab"
-                    aria-selected={typeFilter === key}
-                    onClick={() => onTypeFilterChange(key)}
-                    className={`px-2.5 py-1 text-xs font-medium font-mono tabular-nums rounded-md transition-colors whitespace-nowrap ${
-                      typeFilter === key
-                        ? 'bg-white dark:bg-[#27272A] text-[#09090B] dark:text-[#FAFAFA] shadow-xs'
-                        : 'text-[#52525B] dark:text-[#A1A1AA] hover:text-[#09090B] dark:hover:text-[#FAFAFA]'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <span className="text-xs font-mono tabular-nums text-[#71717A] dark:text-[#A1A1AA]">
-                {videoCount > 0 ? `${videoCount} videos` : `${imageCount} photos`}
-              </span>
-            )}
+            <div className="flex flex-wrap items-center gap-3">
+              {showTypeTabs ? (
+                <div
+                  role="tablist"
+                  aria-label="Filter by media type"
+                  className="inline-flex items-center p-0.5 bg-[#F4F4F5] dark:bg-[#18181B] rounded-lg"
+                >
+                  {(
+                    [
+                      ['all', `All ${items.length}`],
+                      ['image', `Photos ${imageCount}`],
+                      ['video', `Videos ${videoCount}`],
+                    ] as Array<[MediaTypeFilter, string]>
+                  ).map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      role="tab"
+                      aria-selected={typeFilter === key}
+                      onClick={() => onTypeFilterChange(key)}
+                      className={`px-2.5 py-1 text-xs font-medium font-mono tabular-nums rounded-md transition-colors whitespace-nowrap ${
+                        typeFilter === key
+                          ? 'bg-white dark:bg-[#27272A] text-[#09090B] dark:text-[#FAFAFA] shadow-xs'
+                          : 'text-[#52525B] dark:text-[#A1A1AA] hover:text-[#09090B] dark:hover:text-[#FAFAFA]'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-xs font-mono tabular-nums text-[#71717A] dark:text-[#A1A1AA]">
+                  {videoCount > 0 ? `${videoCount} videos` : `${imageCount} photos`}
+                </span>
+              )}
+
+              {platform === 'reddit' && duplicateCount > 0 && onToggleShowDuplicates && (
+                <button
+                  type="button"
+                  onClick={onToggleShowDuplicates}
+                  aria-pressed={showDuplicates}
+                  className={`px-2.5 py-1 text-xs font-mono tabular-nums rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                    showDuplicates
+                      ? 'bg-[#EFF6FF] dark:bg-[#1E3A8A]/30 border-[#1D4ED8]/40 dark:border-[#3B82F6]/40 text-[#1D4ED8] dark:text-[#60A5FA]'
+                      : 'bg-[#FAFAFA] dark:bg-[#18181B] border-[#E4E4E7] dark:border-[#27272A] text-[#52525B] dark:text-[#D4D4D8] hover:border-[#1D4ED8] dark:hover:border-[#3B82F6] hover:text-[#1D4ED8] dark:hover:text-[#60A5FA]'
+                  }`}
+                >
+                  {showDuplicates
+                    ? `Showing ${duplicateCount} ${duplicateCount === 1 ? 'duplicate' : 'duplicates'} · Hide`
+                    : `${duplicateCount} ${duplicateCount === 1 ? 'duplicate' : 'duplicates'} hidden · Show`}
+                </button>
+              )}
+
+              {platform === 'reddit' && visualScanProgress && (
+                <span className="inline-flex items-center gap-1.5 text-xs font-mono tabular-nums text-[#71717A] dark:text-[#A1A1AA] whitespace-nowrap">
+                  <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
+                  <span>
+                    Scanning visuals {visualScanProgress.scanned}/{visualScanProgress.total}
+                  </span>
+                </span>
+              )}
+            </div>
 
             <div className="flex items-center gap-2 flex-1 sm:flex-initial justify-end">
               <div className="relative flex-1 sm:w-48">
@@ -367,10 +492,17 @@ export function StagingDeck({
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
             {pageItems.map((item) => {
               const isSelected = selectedIds.has(item.id);
+              const dupInfo = duplicateAnnotations?.get(item.id);
+              const isDup = Boolean(dupInfo?.isDuplicate);
+              const repeatCount = dupInfo?.repeatCount ?? 0;
+              const dateLabel = formatShortDate(item.createdAt);
+
               return (
                 <article
                   key={item.id}
-                  className={`group border rounded-lg overflow-hidden flex flex-col transition-colors ${
+                  className={`group border rounded-lg overflow-hidden flex flex-col transition-[border-color,opacity] duration-150 ${
+                    isDup ? 'opacity-75 hover:opacity-100' : ''
+                  } ${
                     isSelected
                       ? 'border-[#1D4ED8] dark:border-[#3B82F6] bg-white dark:bg-[#141418]'
                       : 'border-[#E4E4E7] dark:border-[#27272A] bg-white dark:bg-[#141418] hover:border-[#D4D4D8] dark:hover:border-[#3F3F46]'
@@ -417,7 +549,25 @@ export function StagingDeck({
                         <span>{formatContentLabel(item)}</span>
                         <span aria-hidden="true">·</span>
                         <span className="truncate">{item.sourceContainer}</span>
+                        {dateLabel && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-mono tabular-nums shrink-0">
+                              {dateLabel}
+                            </span>
+                          </>
+                        )}
                       </div>
+                      {isDup ? (
+                        <p className="text-[11px] text-[#B45309] dark:text-[#FBBF24] truncate">
+                          Duplicate · {formatDuplicateReason(dupInfo?.matchReason)}
+                        </p>
+                      ) : repeatCount > 0 ? (
+                        <p className="text-[11px] font-mono tabular-nums text-[#52525B] dark:text-[#A1A1AA] truncate">
+                          Original · {repeatCount}{' '}
+                          {repeatCount === 1 ? 'repeat' : 'repeats'}
+                        </p>
+                      ) : null}
                     </div>
 
                     <div className="pt-2 border-t border-[#F4F4F5] dark:border-[#27272A] flex items-center justify-between gap-2">
@@ -464,10 +614,17 @@ export function StagingDeck({
               <tbody className="divide-y divide-[#F4F4F5] dark:divide-[#27272A] text-sm">
                 {pageItems.map((item) => {
                   const isSelected = selectedIds.has(item.id);
+                  const dupInfo = duplicateAnnotations?.get(item.id);
+                  const isDup = Boolean(dupInfo?.isDuplicate);
+                  const repeatCount = dupInfo?.repeatCount ?? 0;
+                  const dateLabel = formatShortDate(item.createdAt);
+
                   return (
                     <tr
                       key={item.id}
                       className={`transition-colors ${
+                        isDup ? 'opacity-75 hover:opacity-100' : ''
+                      } ${
                         isSelected
                           ? 'bg-[#EFF6FF]/60 dark:bg-[#1E3A8A]/20'
                           : 'hover:bg-[#FAFAFA] dark:hover:bg-[#18181B]/70'
@@ -498,12 +655,22 @@ export function StagingDeck({
                             </p>
                             <p className="text-[11px] font-mono text-[#71717A] dark:text-[#A1A1AA] truncate">
                               {item.filename}
+                              {isDup
+                                ? ` · Duplicate (${formatDuplicateReason(dupInfo?.matchReason)})`
+                                : repeatCount > 0
+                                  ? ` · Original (${repeatCount} ${repeatCount === 1 ? 'repeat' : 'repeats'})`
+                                  : ''}
                             </p>
                           </div>
                         </div>
                       </td>
                       <td className="py-2 pr-4 text-xs text-[#52525B] dark:text-[#D4D4D8] whitespace-nowrap">
-                        {item.sourceContainer}
+                        <span>{item.sourceContainer}</span>
+                        {dateLabel && (
+                          <span className="ml-1.5 font-mono tabular-nums text-[#71717A] dark:text-[#A1A1AA]">
+                            · {dateLabel}
+                          </span>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-xs font-mono text-[#52525B] dark:text-[#A1A1AA] whitespace-nowrap">
                         {formatContentLabel(item)} · {item.extension.toUpperCase()}
@@ -642,7 +809,11 @@ export function StagingDeck({
                           disabled={busy}
                           className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-[#E4E4E7] dark:border-[#27272A] bg-white dark:bg-[#111114] text-[#52525B] dark:text-[#D4D4D8] hover:border-[#1D4ED8] dark:hover:border-[#3B82F6] hover:text-[#1D4ED8] dark:hover:text-[#60A5FA] transition-colors whitespace-nowrap disabled:opacity-50"
                         >
-                          <span>Load all</span>
+                          <span>
+                            {job.totalAvailable
+                              ? `Load all (${job.totalAvailable})`
+                              : 'Load all'}
+                          </span>
                         </button>
                       </>
                     )}
@@ -695,7 +866,7 @@ export function StagingDeck({
                               : 'text-[#B91C1C] dark:text-[#F87171]'
                           }`}
                         >
-                          {isAuth ? 'Session Required' : 'Unable to Fetch'}
+                          {isAuth ? 'Access Restricted' : 'Unable to Fetch'}
                         </span>
                         <span aria-hidden="true" className="text-[#A1A1AA]">
                           ·

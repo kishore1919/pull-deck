@@ -3,6 +3,7 @@ import { CheckCircle2, X, XCircle } from 'lucide-react';
 import type {
   BatchExtractResponse,
   CapabilitiesResponse,
+  ContentType,
   ExtractionJob,
   MediaItem,
   Platform,
@@ -13,10 +14,45 @@ import { IntakeRail, type IntakeMode } from './components/IntakeRail';
 import { StagingDeck, type MediaTypeFilter } from './components/StagingDeck';
 import { LightboxModal } from './components/LightboxModal';
 import { buildProxyUrl } from './components/MediaThumbnail';
+import {
+  canHashItemThumbnail,
+  computeThumbnailDHash,
+  deduplicateRedditItems,
+} from './utils/redditDedup';
 
 interface ToastState {
   tone: 'success' | 'error';
   message: string;
+}
+
+const AUTO_STREAM_PROFILE_TYPES = new Set<ContentType>([
+  'ig_profile',
+  'reddit_user',
+  'redgifs_profile',
+]);
+
+function getAdaptiveDelayMs(platform: Platform | null, pagesWalked: number): number {
+  if (platform === 'redgifs') {
+    return pagesWalked >= 6 ? 700 : 350;
+  }
+  if (platform === 'instagram') {
+    return pagesWalked >= 4 ? 1400 : 800;
+  }
+  // Reddit
+  return pagesWalked >= 5 ? 900 : 450;
+}
+
+/**
+ * Uniquely identifies an extracted media entry so retries never duplicate the same submission,
+ * while separate Reddit reposts sharing the same mediaUrl still reach the earliest-original dedup engine.
+ */
+function itemSubmissionKey(item: MediaItem, jobPlatform: Platform | null): string {
+  const effectivePlatform = jobPlatform || item.platform;
+  if (effectivePlatform === 'reddit') {
+    const postKey = item.postId || item.sourceUrl;
+    return `reddit::${postKey}::${item.indexInGroup}::${item.mediaUrl}`;
+  }
+  return item.mediaUrl;
 }
 
 /**
@@ -63,8 +99,6 @@ export default function App() {
     reddit: '',
     redgifs: '',
   });
-  const [subredditLimit, setSubredditLimit] = useState(50);
-  const [subredditSort, setSubredditSort] = useState<'hot' | 'top' | 'new'>('new');
   const [zipOptions, setZipOptions] = useState<ZipOptions>({
     organizeByFolder: true,
     includeMetadataJson: false,
@@ -73,6 +107,14 @@ export default function App() {
   const [jobs, setJobs] = useState<ExtractionJob[]>([]);
   const [items, setItems] = useState<MediaItem[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  // Reddit multi-signal deduplication state (strictly in-memory)
+  const [showRedditDuplicates, setShowRedditDuplicates] = useState(false);
+  const [visualHashes, setVisualHashes] = useState<Map<string, bigint | null>>(
+    () => new Map(),
+  );
+  const hashedIdsRef = useRef<Set<string>>(new Set());
+  const inFlightHashIdsRef = useRef<Set<string>>(new Set());
 
   const [typeFilter, setTypeFilter] = useState<MediaTypeFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -83,6 +125,7 @@ export default function App() {
   const [loadingMoreJobUrl, setLoadingMoreJobUrl] = useState<string | null>(null);
   const [autoLoadingJobUrl, setAutoLoadingJobUrl] = useState<string | null>(null);
   const stopAutoLoadRef = useRef(false);
+  const autoLoadRunIdRef = useRef(0);
 
   const [isBundlingZip, setIsBundlingZip] = useState(false);
   const [zipProgressLabel, setZipProgressLabel] = useState<string | null>(null);
@@ -129,6 +172,122 @@ export default function App() {
     return map;
   }, [jobs]);
 
+  const redditItems = useMemo(
+    () =>
+      items.filter((item) => {
+        const jobPlatform = jobPlatformById.get(item.jobId);
+        return (jobPlatform || item.platform) === 'reddit';
+      }),
+    [items, jobPlatformById],
+  );
+
+  const redditDedup = useMemo(
+    () => deduplicateRedditItems(redditItems, visualHashes),
+    [redditItems, visualHashes],
+  );
+
+  // Progressive background visual thumbnail hashing (Layer 3 dHash) for Reddit items
+  useEffect(() => {
+    const hashable = redditItems.filter(
+      (item) =>
+        canHashItemThumbnail(item) &&
+        !hashedIdsRef.current.has(item.id) &&
+        !inFlightHashIdsRef.current.has(item.id),
+    );
+    if (hashable.length === 0) return;
+
+    let cancelled = false;
+    let cursor = 0;
+    const CONCURRENCY = 4;
+    const pendingBatch = new Map<string, bigint | null>();
+
+    const flushBatch = () => {
+      if (pendingBatch.size === 0 || cancelled) return;
+      const entries = Array.from(pendingBatch.entries());
+      pendingBatch.clear();
+      setVisualHashes((prev) => {
+        const next = new Map(prev);
+        for (const [id, hash] of entries) {
+          next.set(id, hash);
+        }
+        return next;
+      });
+    };
+
+    async function worker() {
+      while (!cancelled && cursor < hashable.length) {
+        const item = hashable[cursor];
+        cursor += 1;
+        if (hashedIdsRef.current.has(item.id) || inFlightHashIdsRef.current.has(item.id)) {
+          continue;
+        }
+        inFlightHashIdsRef.current.add(item.id);
+        const hash = await computeThumbnailDHash(buildProxyUrl(item.thumbnailUrl));
+        inFlightHashIdsRef.current.delete(item.id);
+        if (cancelled) return;
+        hashedIdsRef.current.add(item.id);
+        pendingBatch.set(item.id, hash);
+        if (pendingBatch.size >= 8) {
+          flushBatch();
+          await new Promise((r) => setTimeout(r, 30));
+        }
+      }
+    }
+
+    const workers = Array.from(
+      { length: Math.min(CONCURRENCY, hashable.length) },
+      () => worker(),
+    );
+    void Promise.all(workers).then(() => {
+      flushBatch();
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [redditItems]);
+
+  const redditVisualScanProgress = useMemo(() => {
+    const hashableTotal = redditItems.filter(canHashItemThumbnail).length;
+    if (hashableTotal <= 1) return null;
+    let scanned = 0;
+    for (const item of redditItems) {
+      if (canHashItemThumbnail(item) && visualHashes.has(item.id)) {
+        scanned += 1;
+      }
+    }
+    if (scanned >= hashableTotal) return null;
+    return { scanned, total: hashableTotal };
+  }, [redditItems, visualHashes]);
+
+  // Keep selection synced with earliest-original promotion & hidden duplicate exclusion
+  useEffect(() => {
+    if (redditItems.length === 0) return;
+
+    setSelectedIds((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+
+      for (const [itemId, ann] of redditDedup.annotations.entries()) {
+        if (!ann.isDuplicate) continue;
+        if (next.has(itemId)) {
+          // Transfer selection to the true earliest original when superseded
+          if (!next.has(ann.canonicalId)) {
+            next.add(ann.canonicalId);
+            changed = true;
+          }
+          // When duplicates are hidden, remove hidden duplicate IDs from active selection
+          if (!showRedditDuplicates) {
+            next.delete(itemId);
+            changed = true;
+          }
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [redditDedup, redditItems.length, showRedditDuplicates]);
+
   const countsByPlatform = useMemo(() => {
     const counts: Record<Platform, number> = {
       instagram: 0,
@@ -137,18 +296,40 @@ export default function App() {
     };
     for (const item of items) {
       const target = jobPlatformById.get(item.jobId) || item.platform;
+      if (
+        target === 'reddit' &&
+        !showRedditDuplicates &&
+        redditDedup.hiddenDuplicateIds.has(item.id)
+      ) {
+        continue;
+      }
       counts[target] += 1;
     }
     return counts;
-  }, [items, jobPlatformById]);
+  }, [items, jobPlatformById, showRedditDuplicates, redditDedup.hiddenDuplicateIds]);
 
   const activePlatformItems = useMemo(
     () =>
       items.filter((item) => {
         const jobPlatform = jobPlatformById.get(item.jobId);
-        return (jobPlatform || item.platform) === activePlatform;
+        const resolvedPlatform = jobPlatform || item.platform;
+        if (resolvedPlatform !== activePlatform) return false;
+        if (
+          activePlatform === 'reddit' &&
+          !showRedditDuplicates &&
+          redditDedup.hiddenDuplicateIds.has(item.id)
+        ) {
+          return false;
+        }
+        return true;
       }),
-    [items, jobPlatformById, activePlatform],
+    [
+      items,
+      jobPlatformById,
+      activePlatform,
+      showRedditDuplicates,
+      redditDedup.hiddenDuplicateIds,
+    ],
   );
 
   const activePlatformJobs = useMemo(
@@ -167,21 +348,195 @@ export default function App() {
     [activeSelectedItems, maxZipImages, maxZipVideos],
   );
 
+  async function fetchNextPageForJob(
+    job: ExtractionJob,
+    runId?: number,
+  ): Promise<{ mergedJob: ExtractionJob; addedCount: number } | null> {
+    if (!job.nextCursor) return null;
+    const nextPage = (job.pageNumber || 1) + 1;
+
+    const response = await fetch('/api/extract/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        urls: [job.sourceUrl],
+        cursor: job.nextCursor,
+        pageNumber: nextPage,
+      }),
+    });
+
+    if (!response.ok) {
+      const errPayload = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
+      throw new Error(errPayload.error || `Pagination failed (${response.status})`);
+    }
+
+    const data = (await response.json()) as BatchExtractResponse;
+    // If cancelled/cleared while request was in flight, discard cleanly
+    if (runId !== undefined && runId !== autoLoadRunIdRef.current) {
+      return null;
+    }
+
+    const updatedJob = data.jobs[0];
+    let addedCount = 0;
+    const addedIds: string[] = [];
+
+    // Attach newly fetched items to the original jobId so platform scoping stays unified
+    const normalizedItems = data.items.map((item) => ({
+      ...item,
+      jobId: job.id,
+    }));
+
+    setItems((prev) => {
+      const existingKeys = new Set(
+        prev.map((m) => itemSubmissionKey(m, jobPlatformById.get(m.jobId) ?? null)),
+      );
+      const fresh = normalizedItems.filter((m) => {
+        const key = itemSubmissionKey(m, job.platform);
+        if (existingKeys.has(key)) return false;
+        existingKeys.add(key);
+        return true;
+      });
+      addedCount = fresh.length;
+      fresh.forEach((m) => addedIds.push(m.id));
+      return [...prev, ...fresh];
+    });
+
+    if (addedIds.length > 0) {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        addedIds.forEach((id) => next.add(id));
+        return next;
+      });
+    }
+
+    const mergedJob: ExtractionJob = {
+      ...job,
+      hasMore: Boolean(updatedJob?.hasMore && updatedJob?.nextCursor),
+      nextCursor: updatedJob?.nextCursor,
+      pageNumber: nextPage,
+      itemCount: job.itemCount + addedCount,
+      totalAvailable: updatedJob?.totalAvailable ?? job.totalAvailable,
+    };
+
+    setJobs((prev) =>
+      prev.map((existing) =>
+        existing.sourceUrl === job.sourceUrl ? mergedJob : existing,
+      ),
+    );
+
+    return { mergedJob, addedCount };
+  }
+
+  /**
+   * Adaptive Auto-Pagination Engine:
+   * Streams remaining pages with platform-aware pacing, transient retry backoff,
+   * and instant Stop / Clear cancellation across Instagram, Reddit, and RedGIFs.
+   */
+  async function streamRemainingPages(initialJob: ExtractionJob) {
+    if (!initialJob.nextCursor) return;
+
+    const runId = autoLoadRunIdRef.current + 1;
+    autoLoadRunIdRef.current = runId;
+    stopAutoLoadRef.current = false;
+    setAutoLoadingJobUrl(initialJob.sourceUrl);
+
+    let current: ExtractionJob = initialJob;
+    let pagesWalked = 0;
+    let consecutiveEmptyPages = 0;
+    const MAX_AUTO_PAGES = 60;
+
+    try {
+      while (
+        !stopAutoLoadRef.current &&
+        runId === autoLoadRunIdRef.current &&
+        current.hasMore &&
+        current.nextCursor &&
+        pagesWalked < MAX_AUTO_PAGES
+      ) {
+        await new Promise((r) =>
+          setTimeout(r, getAdaptiveDelayMs(current.platform, pagesWalked)),
+        );
+        if (stopAutoLoadRef.current || runId !== autoLoadRunIdRef.current) {
+          break;
+        }
+
+        let stepResult: { mergedJob: ExtractionJob; addedCount: number } | null = null;
+        try {
+          stepResult = await fetchNextPageForJob(current, runId);
+        } catch {
+          // Adaptive single retry with gentle backoff for transient rate limits
+          if (stopAutoLoadRef.current || runId !== autoLoadRunIdRef.current) {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 1800));
+          if (stopAutoLoadRef.current || runId !== autoLoadRunIdRef.current) {
+            break;
+          }
+          stepResult = await fetchNextPageForJob(current, runId);
+        }
+
+        if (!stepResult || runId !== autoLoadRunIdRef.current) {
+          break;
+        }
+
+        pagesWalked += 1;
+        current = stepResult.mergedJob;
+
+        if (stepResult.addedCount === 0) {
+          consecutiveEmptyPages += 1;
+          if (consecutiveEmptyPages >= 3) break;
+        } else {
+          consecutiveEmptyPages = 0;
+        }
+
+        if (!current.hasMore || !current.nextCursor) {
+          break;
+        }
+      }
+
+      if (runId === autoLoadRunIdRef.current) {
+        showToast(
+          'success',
+          stopAutoLoadRef.current
+            ? `Paused at ${current.itemCount} fetched posts.`
+            : `Loaded ${current.itemCount} posts total.`,
+        );
+      }
+    } catch (err) {
+      if (runId === autoLoadRunIdRef.current) {
+        showToast(
+          'error',
+          err instanceof Error
+            ? `${err.message} (${current.itemCount} posts kept)`
+            : `Paused at ${current.itemCount} posts.`,
+        );
+      }
+    } finally {
+      if (runId === autoLoadRunIdRef.current) {
+        setAutoLoadingJobUrl(null);
+        stopAutoLoadRef.current = false;
+      }
+    }
+  }
+
   async function runExtraction(urls: string[]) {
-    if (urls.length === 0 || isExtracting || loadingMoreJobUrl || autoLoadingJobUrl) {
+    if (urls.length === 0 || isExtracting || loadingMoreJobUrl) {
       return;
     }
+
+    // Cancel any previous background auto-stream before starting a fresh fetch
+    autoLoadRunIdRef.current += 1;
+    stopAutoLoadRef.current = true;
+    setAutoLoadingJobUrl(null);
     setIsExtracting(true);
 
     try {
       const response = await fetch('/api/extract/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          urls,
-          subredditLimit,
-          subredditSort,
-        }),
+        body: JSON.stringify({ urls }),
       });
 
       if (!response.ok) {
@@ -199,14 +554,29 @@ export default function App() {
         setActivePlatform(firstResolvedPlatform);
       }
 
+      const incomingPlatformByJob = new Map<string, Platform | null>();
+      for (const j of data.jobs) {
+        incomingPlatformByJob.set(j.id, j.platform);
+      }
+
       setJobs((prev) => {
         const replacedUrls = new Set(data.jobs.map((j) => j.sourceUrl));
         return [...data.jobs, ...prev.filter((j) => !replacedUrls.has(j.sourceUrl))];
       });
 
       setItems((prev) => {
-        const existingMediaUrls = new Set(prev.map((m) => m.mediaUrl));
-        const fresh = data.items.filter((m) => !existingMediaUrls.has(m.mediaUrl));
+        const existingKeys = new Set(
+          prev.map((m) => itemSubmissionKey(m, jobPlatformById.get(m.jobId) ?? null)),
+        );
+        const fresh = data.items.filter((m) => {
+          const key = itemSubmissionKey(
+            m,
+            incomingPlatformByJob.get(m.jobId) ?? m.platform,
+          );
+          if (existingKeys.has(key)) return false;
+          existingKeys.add(key);
+          return true;
+        });
         return [...fresh, ...prev];
       });
 
@@ -218,18 +588,41 @@ export default function App() {
         return next;
       });
 
+      // Automatically continue streaming remaining pages for finite User Profiles
+      // (Instagram profiles, Reddit user profiles, RedGIFs profiles)
+      const autoStreamProfileJob =
+        data.jobs.length === 1
+          ? data.jobs.find(
+              (j) =>
+                j.status === 'ready' &&
+                j.hasMore &&
+                Boolean(j.nextCursor) &&
+                AUTO_STREAM_PROFILE_TYPES.has(j.contentType),
+            )
+          : undefined;
+
       if (data.items.length > 0) {
+        if (autoStreamProfileJob) {
+          const totalHint = autoStreamProfileJob.totalAvailable
+            ? ` of ${autoStreamProfileJob.totalAvailable}`
+            : '';
+          showToast(
+            'success',
+            `Loaded ${data.items.length}${totalHint} — streaming remaining pages...`,
+          );
+          setIsExtracting(false);
+          void streamRemainingPages(autoStreamProfileJob);
+          return;
+        }
         showToast(
           'success',
           `Loaded ${data.items.length} ${data.items.length === 1 ? 'file' : 'files'}.`,
         );
       } else {
-        const hasAuth = data.jobs.some((j) => j.status === 'auth_required');
+        const firstIssue = data.jobs.find((j) => j.status !== 'ready');
         showToast(
           'error',
-          hasAuth
-            ? 'Instagram session required for this link.'
-            : 'No downloadable media found.',
+          firstIssue?.message || 'No downloadable media found.',
         );
       }
     } catch (err) {
@@ -242,88 +635,22 @@ export default function App() {
     }
   }
 
-  async function fetchNextPageForJob(job: ExtractionJob): Promise<ExtractionJob | null> {
-    if (!job.nextCursor) return null;
-    const nextPage = (job.pageNumber || 1) + 1;
-
-    const response = await fetch('/api/extract/batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        urls: [job.sourceUrl],
-        subredditLimit,
-        subredditSort,
-        cursor: job.nextCursor,
-        pageNumber: nextPage,
-      }),
-    });
-
-    if (!response.ok) {
-      const errPayload = (await response.json().catch(() => ({}))) as {
-        error?: string;
-      };
-      throw new Error(errPayload.error || `Pagination failed (${response.status})`);
-    }
-
-    const data = (await response.json()) as BatchExtractResponse;
-    const updatedJob = data.jobs[0];
-
-    let addedCount = 0;
-    const addedIds: string[] = [];
-    // Attach newly fetched items to the original jobId so platform scoping stays unified
-    const normalizedItems = data.items.map((item) => ({
-      ...item,
-      jobId: job.id,
-    }));
-
-    setItems((prev) => {
-      const existingMediaUrls = new Set(prev.map((m) => m.mediaUrl));
-      const fresh = normalizedItems.filter((m) => !existingMediaUrls.has(m.mediaUrl));
-      addedCount = fresh.length;
-      fresh.forEach((m) => addedIds.push(m.id));
-      return [...prev, ...fresh];
-    });
-
-    if (addedIds.length > 0) {
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        addedIds.forEach((id) => next.add(id));
-        return next;
-      });
-    }
-
-    const mergedJob: ExtractionJob = {
-      ...job,
-      hasMore: Boolean(updatedJob?.hasMore && data.items.length > 0),
-      nextCursor: updatedJob?.nextCursor,
-      pageNumber: nextPage,
-      itemCount: job.itemCount + addedCount,
-      totalAvailable: updatedJob?.totalAvailable ?? job.totalAvailable,
-    };
-
-    setJobs((prev) =>
-      prev.map((existing) =>
-        existing.sourceUrl === job.sourceUrl ? mergedJob : existing,
-      ),
-    );
-
-    return mergedJob;
-  }
-
   async function handleLoadMore(job: ExtractionJob) {
     if (!job.nextCursor || isExtracting || loadingMoreJobUrl || autoLoadingJobUrl) {
       return;
     }
     setLoadingMoreJobUrl(job.sourceUrl);
     try {
-      const updated = await fetchNextPageForJob(job);
-      if (updated) {
-        const delta = updated.itemCount - job.itemCount;
+      const result = await fetchNextPageForJob(job);
+      if (result) {
+        const { mergedJob, addedCount } = result;
         showToast(
           'success',
-          delta > 0
-            ? `Page ${updated.pageNumber} loaded (+${delta} files).`
-            : 'Reached the end of available media.',
+          addedCount > 0
+            ? `Page ${mergedJob.pageNumber} loaded (+${addedCount} files).`
+            : mergedJob.hasMore
+              ? 'Page contained text-only posts — click Load more to continue.'
+              : 'Reached the end of available media.',
         );
       }
     } catch (err) {
@@ -340,48 +667,7 @@ export default function App() {
     if (!initialJob.nextCursor || isExtracting || loadingMoreJobUrl || autoLoadingJobUrl) {
       return;
     }
-    stopAutoLoadRef.current = false;
-    setAutoLoadingJobUrl(initialJob.sourceUrl);
-
-    let current: ExtractionJob = initialJob;
-    let pagesWalked = 0;
-    const MAX_AUTO_PAGES = 30; // up to ~2,400+ items safely
-
-    try {
-      while (
-        !stopAutoLoadRef.current &&
-        current.hasMore &&
-        current.nextCursor &&
-        pagesWalked < MAX_AUTO_PAGES
-      ) {
-        const next = await fetchNextPageForJob(current);
-        pagesWalked += 1;
-        if (!next || !next.hasMore || !next.nextCursor) {
-          if (next) current = next;
-          break;
-        }
-        current = next;
-        // Polite delay between pages to avoid upstream rate limits
-        await new Promise((r) => setTimeout(r, 450));
-      }
-
-      showToast(
-        'success',
-        stopAutoLoadRef.current
-          ? `Stopped at ${current.itemCount} loaded files.`
-          : `Loaded ${current.itemCount} files total.`,
-      );
-    } catch (err) {
-      showToast(
-        'error',
-        err instanceof Error
-          ? `${err.message} (${current.itemCount} files kept)`
-          : 'Stopped loading pages.',
-      );
-    } finally {
-      setAutoLoadingJobUrl(null);
-      stopAutoLoadRef.current = false;
-    }
+    await streamRemainingPages(initialJob);
   }
 
   function handleStopLoadAll() {
@@ -418,13 +704,41 @@ export default function App() {
   }
 
   function handleClearPlatform() {
-    const platformIdSet = new Set(activePlatformItems.map((i) => i.id));
+    // Stop any background auto-stream running for this platform
+    const activeJobMatchesPlatform = activePlatformJobs.some(
+      (j) => j.sourceUrl === autoLoadingJobUrl,
+    );
+    if (activeJobMatchesPlatform) {
+      autoLoadRunIdRef.current += 1;
+      stopAutoLoadRef.current = true;
+      setAutoLoadingJobUrl(null);
+    }
+
+    const allIdsForPlatform = new Set(
+      items
+        .filter((i) => (jobPlatformById.get(i.jobId) || i.platform) === activePlatform)
+        .map((i) => i.id),
+    );
+
+    if (activePlatform === 'reddit') {
+      setShowRedditDuplicates(false);
+      allIdsForPlatform.forEach((id) => {
+        hashedIdsRef.current.delete(id);
+        inFlightHashIdsRef.current.delete(id);
+      });
+      setVisualHashes((prev) => {
+        const next = new Map(prev);
+        allIdsForPlatform.forEach((id) => next.delete(id));
+        return next;
+      });
+    }
+
     setInputsByPlatform((prev) => ({ ...prev, [activePlatform]: '' }));
     setJobs((prev) => prev.filter((j) => j.platform !== activePlatform));
-    setItems((prev) => prev.filter((i) => !platformIdSet.has(i.id)));
+    setItems((prev) => prev.filter((i) => !allIdsForPlatform.has(i.id)));
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      platformIdSet.forEach((id) => next.delete(id));
+      allIdsForPlatform.forEach((id) => next.delete(id));
       return next;
     });
     setTypeFilter('all');
@@ -581,10 +895,6 @@ export default function App() {
           onRawInputChange={(val) =>
             setInputsByPlatform((prev) => ({ ...prev, [activePlatform]: val }))
           }
-          subredditLimit={subredditLimit}
-          onSubredditLimitChange={setSubredditLimit}
-          subredditSort={subredditSort}
-          onSubredditSortChange={setSubredditSort}
           zipOptions={zipOptions}
           onZipOptionsChange={setZipOptions}
           isExtracting={isExtracting}
@@ -610,6 +920,23 @@ export default function App() {
           zipProgressLabel={zipProgressLabel}
           zipPartCount={activeZipPartCount}
           selectedCount={activeSelectedItems.length}
+          duplicateAnnotations={
+            activePlatform === 'reddit' ? redditDedup.annotations : undefined
+          }
+          duplicateCount={
+            activePlatform === 'reddit' ? redditDedup.duplicateCount : 0
+          }
+          showDuplicates={
+            activePlatform === 'reddit' ? showRedditDuplicates : false
+          }
+          onToggleShowDuplicates={
+            activePlatform === 'reddit'
+              ? () => setShowRedditDuplicates((prev) => !prev)
+              : undefined
+          }
+          visualScanProgress={
+            activePlatform === 'reddit' ? redditVisualScanProgress : null
+          }
           onToggleSelect={handleToggleSelect}
           onSelectVisible={handleSelectVisible}
           onDeselectPlatform={handleDeselectPlatform}

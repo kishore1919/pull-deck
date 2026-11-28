@@ -32,6 +32,15 @@ export interface ParsedUrlEntry {
   reason?: string;
 }
 
+export type DuplicateMatchReason = 'exact' | 'visual' | 'title';
+
+export interface DuplicateAnnotation {
+  isDuplicate: boolean;
+  canonicalId: string;
+  repeatCount: number;
+  matchReason?: DuplicateMatchReason;
+}
+
 export interface MediaItem {
   id: string;
   jobId: string;
@@ -53,6 +62,9 @@ export interface MediaItem {
   groupSize: number;
   createdAt?: string;
   hasAudioTrack?: boolean;
+  postId?: string;
+  crosspostRootId?: string;
+  canonicalMediaKey?: string;
 }
 
 export interface ExtractionJob {
@@ -115,8 +127,6 @@ export interface CapabilitiesResponse {
   instagramPublic: boolean;
   instagramInstaloaderAvailable: boolean;
   instagramInstaloaderVersion?: string | null;
-  instagramSessionConfigured: boolean;
-  instagramRapidApiConfigured: boolean;
   maxBatchUrls: number;
   maxZipItems: number;
   maxZipVideoItems: number;

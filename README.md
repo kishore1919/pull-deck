@@ -8,11 +8,15 @@
 
 - **Platform-Focused Workspace (`Instagram` | `Reddit` | `RedGIFs`)**: Dedicated page per platform with per-platform input memory, live staged counts, and a stateless **Dark / Light** theme switcher.
 - **Single, Profile & Bulk Queue Intake**: Paste a username (`@handle`, `u/user`, `r/subreddit`), a direct URL, or up to 25 mixed links (paste or `.txt` file import).
-- **Large Profile Pagination (600+ Photos & Videos)**:
-  - Configurable per-page fetch limits (`12`, `25`, `50`, `80`, `100`) and feed sorting (`Latest`, `Top`, `Hot`).
-  - **Load more** and **Load all** (with a live counter and **Stop** button) across RedGIFs, Reddit, and Instagram.
+- **Adaptive Auto-Pagination (600+ Photos & Videos, Zero Manual Limits)**:
+  - Each platform automatically fetches in its optimal native chunk size (`100` Reddit, `80` RedGIFs, `30` Instagram) for fast first paint.
+  - **User Profiles** (`@handle`, `u/user`, `redgifs.com/users/…`) automatically stream all remaining pages in the background with adaptive pacing, live progress counters, and an instant **Stop** button.
+  - **Subreddits** (`r/subreddit`) pull a fast initial batch and expose top-bar **Load more** and **Load all** (with **Stop**) controls.
   - Native `FrozenNodeIterator` cursor resumption for deep Instagram pagination via Python Instaloader.
   - Windowed client rendering (60 thumbnails per view page with **Prev / Next**) so 600+ loaded items remain responsive.
+- **Reddit Smart Deduplication (Earliest-Original Filtering)**:
+  - Three-layer Union-Find deduplication combining exact media/crosspost fingerprinting, normalized title + dimension matching, and progressive client-side 64-bit perceptual thumbnail hashing (dHash).
+  - Always promotes the **earliest original post by date** as deeper historical pages stream in, hides repeated reposts by default (excluding them from ZIP and `.txt` exports), and provides a live hidden-count **Show / Hide** toggle.
 - **Flexible Downloads**:
   - **Direct single-file download** or **Lightbox Preview** (image zoom + HTML5 video playback).
   - **Video-Aware Multi-Part ZIP Bundling**: Automatically splits large selections into sequential ZIP parts (**up to 50 photos** or **up to 12 HD videos** per ZIP part, up to 300 MB/part) with optional platform/profile folder grouping and `metadata.json`.
@@ -25,7 +29,7 @@
 
 | Platform | Supported Targets | Extraction Engine |
 | :--- | :--- | :--- |
-| **Instagram** | Public Profiles (`instagram.com/<user>/`), Posts & Carousels (`/p/<id>/`), Reels (`/reel/<id>/`), Stories (`/stories/<user>/`), Highlights (`/stories/highlights/<id>/`) | Python **Instaloader** worker + public embed fallback (optional server session or RapidAPI for Stories, Highlights, and cloud-IP profile grids) |
+| **Instagram** | Public Profiles (`instagram.com/<user>/`), Posts & Carousels (`/p/<id>/`), Reels (`/reel/<id>/`) | Anonymous Python **Instaloader** engine only (zero login, zero env variables, self-healing runtime bootstrap, multi-layer Polaris/SSR/embed fallbacks) |
 | **Reddit** | User Profiles (`reddit.com/u/<user>`), Subreddits (`reddit.com/r/<sub>`), Posts, Galleries, Videos, Share links (`redd.it/<id>`) | Live public JSON + automatic **Arctic Shift** fallback + automatic embedded **RedGIFs** unwrapping |
 | **RedGIFs** | Public Profiles (`redgifs.com/users/<user>`), Single HD Clips (`redgifs.com/watch/<id>`, `/ifr/<id>`) | Live RedGIFs API v2 with consistent page-size pagination |
 
@@ -34,8 +38,8 @@
 ## Tech Stack
 
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Lucide Icons
-- **Backend**: Node.js, Express, `archiver` (streaming ZIP), `cheerio`
-- **Python Worker**: Python 3.11+, `instaloader` (`requirements.txt`)
+- **Backend**: Node.js, Express, `archiver` (streaming ZIP)
+- **Instagram Engine**: Python 3.11+, `instaloader>=4.16` (`requirements.txt`, auto-bootstrapped)
 
 ---
 
@@ -46,30 +50,19 @@
 npm install
 ```
 
-### 2. Install Python Instaloader (for Instagram workloads)
-Create a local virtual environment and install `requirements.txt`:
+### 2. Python Instaloader Runtime (Automatic — Zero Variables Required)
+PullDeck automatically detects `.venv`, creates a virtual environment from system `python3`, or bootstraps a self-contained portable Python 3.11 runtime with `instaloader>=4.16` on minimal containers—with **no login and no environment variables**.
+
+For optional manual pre-installation locally:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
-PullDeck automatically detects `.venv/bin/python` (or `PYTHON_BIN` / system `python3`) at startup.
 
-### 3. Configure environment variables (Optional)
-Copy `.env.example` to `.env`:
-```bash
-cp .env.example .env
-```
+### 3. Environment Variables (Optional)
+No Instagram or Python variables are required. Only `PORT` (defaults to `3000`) is optional.
 
-| Variable | Required | Description |
-| :--- | :---: | :--- |
-| `PORT` | No | Server port (defaults to `3000`) |
-| `INSTAGRAM_SESSION_ID` | No | Optional server-side Instagram `sessionid` cookie for Instaloader (unlocks Stories, Highlights, and prevents cloud-IP rate limits on public profiles) |
-| `INSTAGRAM_USERNAME` | No | Optional Instagram handle matching `INSTAGRAM_SESSION_ID` to speed up Instaloader session initialization |
-| `PYTHON_BIN` | No | Optional custom path to Python executable containing `instaloader` |
-| `INSTAGRAM_RAPIDAPI_KEY` | No | Optional RapidAPI key for a managed Instagram scraper provider |
-| `INSTAGRAM_RAPIDAPI_HOST` | No | Optional RapidAPI host (e.g., `instagram-scraper-api2.p.rapidapi.com`) |
-
-> **Note on Instagram from Cloud Servers**: Running PullDeck locally on a residential network allows anonymous Instaloader requests for many public profiles/posts. When hosted on cloud datacenter IPs (Cloud Run, AWS, GCP), Instagram aggressively rate-limits (`HTTP 429`) or login-gates anonymous profile calls—configuring `INSTAGRAM_SESSION_ID` or a RapidAPI connector resolves this on the server without exposing credentials to the browser.
+> **Note on Instagram from Cloud Servers**: Public posts, carousels, and reels resolve automatically via Instaloader's multi-layer GraphQL/SSR/embed cascade even when GraphQL is throttled. When hosted on shared cloud datacenter IPs (Cloud Run, AWS, GCP), Instagram may still hard-block anonymous profile listings—running PullDeck locally on a residential network unlocks full anonymous Instaloader profile pagination.
 
 ### 4. Run in development
 ```bash
@@ -108,7 +101,7 @@ npm run lint
 ├── server/
 │   ├── security.ts                    # URL allowlist, private IP blocking, safeFetch, filename sanitization
 │   ├── extractors/
-│   │   ├── instagram.ts               # Instagram pipeline (Instaloader + fallbacks)
+│   │   ├── instagram.ts               # Instagram pipeline (anonymous Python Instaloader + embed fallback)
 │   │   ├── instaloaderBridge.ts       # Node-to-Python Instaloader subprocess bridge
 │   │   ├── reddit.ts                  # Reddit JSON + Arctic Shift fallback + RedGIFs unwrapper
 │   │   └── redgifs.ts                 # RedGIFs v2 API extractor with exact pagination

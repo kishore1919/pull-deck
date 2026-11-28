@@ -16,7 +16,10 @@ import type {
 } from './src/types.ts';
 import { classifyUrl } from './src/utils/urlParser.ts';
 import { extractInstagramUrl } from './server/extractors/instagram.ts';
-import { detectInstaloaderRuntime } from './server/extractors/instaloaderBridge.ts';
+import {
+  detectInstaloaderRuntime,
+  ensureInstaloaderRuntime,
+} from './server/extractors/instaloaderBridge.ts';
 import { extractRedditUrl } from './server/extractors/reddit.ts';
 import { extractRedgifsUrl } from './server/extractors/redgifs.ts';
 import {
@@ -29,7 +32,12 @@ const PORT = Number(process.env.PORT) || 3000;
 const MAX_BATCH_URLS = 25;
 const MAX_ZIP_ITEMS = 50;
 const MAX_ZIP_VIDEO_ITEMS = 12;
-const MAX_PROFILE_LIMIT = 100;
+const MAX_PROFILE_LIMIT = 500;
+const PLATFORM_OPTIMAL_PAGE_SIZE = {
+  reddit: 100,
+  redgifs: 80,
+  instagram: 30,
+} as const;
 const EXTRACT_CONCURRENCY = 4;
 const ALLOWED_PROXY_CONTENT_TYPES = [
   'image/',
@@ -90,11 +98,6 @@ async function startServer() {
       instagramPublic: true,
       instagramInstaloaderAvailable: instaloaderRuntime.available,
       instagramInstaloaderVersion: instaloaderRuntime.version,
-      instagramSessionConfigured: Boolean(process.env.INSTAGRAM_SESSION_ID?.trim()),
-      instagramRapidApiConfigured: Boolean(
-        process.env.INSTAGRAM_RAPIDAPI_KEY?.trim() &&
-          process.env.INSTAGRAM_RAPIDAPI_HOST?.trim(),
-      ),
       maxBatchUrls: MAX_BATCH_URLS,
       maxZipItems: MAX_ZIP_ITEMS,
       maxZipVideoItems: MAX_ZIP_VIDEO_ITEMS,
@@ -121,14 +124,14 @@ async function startServer() {
       return;
     }
 
-    const profileLimit = Math.min(
-      Math.max(Number(body.subredditLimit) || 25, 1),
-      MAX_PROFILE_LIMIT,
-    );
+    const explicitLimit =
+      typeof body.subredditLimit === 'number' && Number.isFinite(body.subredditLimit)
+        ? Math.min(Math.max(Math.floor(body.subredditLimit), 1), MAX_PROFILE_LIMIT)
+        : undefined;
     const profileSort =
-      body.subredditSort === 'top' || body.subredditSort === 'new'
+      body.subredditSort === 'top' || body.subredditSort === 'hot'
         ? body.subredditSort
-        : 'hot';
+        : 'new';
     const cursor =
       typeof body.cursor === 'string' && body.cursor.length <= 16384
         ? body.cursor
@@ -165,13 +168,15 @@ async function startServer() {
         }
 
         const effectiveCursor = rawUrls.length === 1 ? cursor : undefined;
+        const pageLimit =
+          explicitLimit ?? PLATFORM_OPTIMAL_PAGE_SIZE[classified.platform];
 
         if (classified.platform === 'reddit') {
           return extractRedditUrl(
             classified.normalized,
             classified.contentType,
             jobId,
-            profileLimit,
+            pageLimit,
             profileSort,
             effectiveCursor,
             pageNumber,
@@ -183,7 +188,7 @@ async function startServer() {
             classified.normalized,
             classified.contentType,
             jobId,
-            profileLimit,
+            pageLimit,
             profileSort,
             effectiveCursor,
             pageNumber,
@@ -194,7 +199,7 @@ async function startServer() {
           classified.normalized,
           classified.contentType,
           jobId,
-          profileLimit,
+          pageLimit,
           effectiveCursor,
           pageNumber,
         );
@@ -473,6 +478,8 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`PullDeck server listening on http://0.0.0.0:${PORT}`);
+    // Automatically prepare Python Instaloader venv in background on fresh containers
+    void ensureInstaloaderRuntime();
   });
 }
 

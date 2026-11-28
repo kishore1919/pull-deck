@@ -106,33 +106,96 @@ function slugifyTitle(title: string): string {
     .slice(0, 42);
 }
 
+function computeCanonicalMediaKey(rawUrl: string, explicitRedgifsId?: string): string {
+  if (explicitRedgifsId) {
+    return `redgifs:${explicitRedgifsId.toLowerCase()}`;
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+
+    // Direct & preview Reddit images (i.redd.it/<id>.jpg, preview.redd.it/<id>.jpg?...)
+    if (host === 'i.redd.it' || host === 'preview.redd.it' || host === 'external-preview.redd.it') {
+      const filePart = pathname.split('/').pop() || '';
+      const stem = filePart.replace(/\.(jpg|jpeg|png|webp|gif|mp4)$/i, '').toLowerCase();
+      if (stem && /^[a-z0-9_-]{5,}$/i.test(stem)) {
+        return `ireddit:${stem}`;
+      }
+    }
+
+    // Reddit-hosted video (v.redd.it/<videoId>/DASH_720.mp4?...)
+    if (host === 'v.redd.it') {
+      const videoId = pathname.split('/').filter(Boolean)[0]?.toLowerCase();
+      if (videoId) {
+        return `vreddit:${videoId}`;
+      }
+    }
+
+    // Imgur direct media (i.imgur.com/<id>.<ext>)
+    if (host === 'i.imgur.com' || host === 'imgur.com') {
+      const filePart = pathname.split('/').pop() || '';
+      const stem = filePart.replace(/\.(jpg|jpeg|png|webp|gif|gifv|mp4)$/i, '').toLowerCase();
+      if (stem && /^[a-z0-9]{5,}$/i.test(stem)) {
+        return `imgur:${stem}`;
+      }
+    }
+
+    // RedGIFs media CDN URLs (media.redgifs.com/<ClipName>.mp4)
+    if (host.endsWith('redgifs.com')) {
+      const filePart = pathname.split('/').pop() || '';
+      const stem = filePart
+        .replace(/-(mobile|silent|poster|large|hd)$/i, '')
+        .replace(/\.(mp4|jpg|jpeg|webp|webm)$/i, '')
+        .toLowerCase();
+      if (stem) {
+        return `redgifs:${stem}`;
+      }
+    }
+
+    return `url:${host}${pathname.toLowerCase()}`;
+  } catch {
+    return `url:${rawUrl.trim().toLowerCase()}`;
+  }
+}
+
 async function extractMediaFromPost(
   post: RedditPostData,
   jobId: string,
   strictMediaOnly = false,
 ): Promise<MediaItem[]> {
-  const effectivePost =
+  const crosspostParent =
     post.crosspost_parent_list && post.crosspost_parent_list.length > 0
-      ? {
-          ...post.crosspost_parent_list[0],
-          title: post.title || post.crosspost_parent_list[0].title,
-          subreddit: post.subreddit || post.crosspost_parent_list[0].subreddit,
-          permalink: post.permalink || post.crosspost_parent_list[0].permalink,
-        }
-      : post;
+      ? post.crosspost_parent_list[0]
+      : undefined;
+  const effectivePost = crosspostParent
+    ? {
+        ...crosspostParent,
+        title: post.title || crosspostParent.title,
+        subreddit: post.subreddit || crosspostParent.subreddit,
+        permalink: post.permalink || crosspostParent.permalink,
+      }
+    : post;
+
+  const submissionPostId = post.id || effectivePost.id;
+  const crosspostBaseRootId = crosspostParent?.id || undefined;
 
   const title = (effectivePost.title || 'Reddit Media Post').trim();
-  const author = effectivePost.author ? `u/${effectivePost.author}` : 'u/unknown';
+  const author = (post.author || effectivePost.author)
+    ? `u/${post.author || effectivePost.author}`
+    : 'u/unknown';
   const subreddit = effectivePost.subreddit
     ? `r/${effectivePost.subreddit}`
     : 'r/reddit';
   const sourceUrl = effectivePost.permalink
     ? `https://www.reddit.com${effectivePost.permalink}`
     : effectivePost.url || 'https://www.reddit.com';
-  const createdAt = effectivePost.created_utc
-    ? new Date(effectivePost.created_utc * 1000).toISOString()
+  // Prefer the submission's own timestamp so an original post always predates its crosspost
+  const submissionUtc = post.created_utc ?? effectivePost.created_utc;
+  const createdAt = submissionUtc
+    ? new Date(submissionUtc * 1000).toISOString()
     : undefined;
-  const slug = slugifyTitle(title) || effectivePost.id || 'reddit_post';
+  const slug = slugifyTitle(title) || submissionPostId || 'reddit_post';
   const items: MediaItem[] = [];
 
   // 0. Embedded RedGIFs clip inside Reddit post
@@ -147,7 +210,16 @@ async function extractMediaFromPost(
       sourceContainer: subreddit,
     });
     if (resolvedRedgif) {
-      return [resolvedRedgif];
+      return [
+        {
+          ...resolvedRedgif,
+          author,
+          createdAt: createdAt ?? resolvedRedgif.createdAt,
+          postId: submissionPostId,
+          crosspostRootId: crosspostBaseRootId,
+          canonicalMediaKey: computeCanonicalMediaKey(resolvedRedgif.mediaUrl, redgifsId),
+        },
+      ];
     }
   }
 
@@ -236,6 +308,11 @@ async function extractMediaFromPost(
         indexInGroup: idx + 1,
         groupSize: resolvedSlides.length,
         createdAt,
+        postId: submissionPostId,
+        crosspostRootId: crosspostBaseRootId
+          ? `${crosspostBaseRootId}:slide_${idx + 1}`
+          : undefined,
+        canonicalMediaKey: computeCanonicalMediaKey(slide.mediaUrl),
       });
     });
 
@@ -276,6 +353,9 @@ async function extractMediaFromPost(
       createdAt,
       hasAudioTrack:
         'has_audio' in redditVideo ? Boolean(redditVideo.has_audio) : undefined,
+      postId: submissionPostId,
+      crosspostRootId: crosspostBaseRootId,
+      canonicalMediaKey: computeCanonicalMediaKey(videoUrl),
     });
     return items;
   }
@@ -308,6 +388,9 @@ async function extractMediaFromPost(
       indexInGroup: 1,
       groupSize: 1,
       createdAt,
+      postId: submissionPostId,
+      crosspostRootId: crosspostBaseRootId,
+      canonicalMediaKey: computeCanonicalMediaKey(previewVariantMp4),
     });
     return items;
   }
@@ -349,6 +432,9 @@ async function extractMediaFromPost(
       indexInGroup: 1,
       groupSize: 1,
       createdAt,
+      postId: submissionPostId,
+      crosspostRootId: crosspostBaseRootId,
+      canonicalMediaKey: computeCanonicalMediaKey(chosenImage),
     });
   }
 
@@ -412,24 +498,33 @@ async function fetchArcticShiftPage(
     endpoint = `https://arctic-shift.photon-reddit.com/api/posts/search?author=${encodeURIComponent(query.name)}&limit=${safePageSize}&sort=desc${beforeParam}`;
   }
 
-  const { response } = await safeFetch(
-    endpoint,
-    'extract',
-    {
-      headers: {
-        'User-Agent': REDDIT_USER_AGENT,
-        Accept: 'application/json',
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const { response } = await safeFetch(
+      endpoint,
+      'extract',
+      {
+        headers: {
+          'User-Agent': REDDIT_USER_AGENT,
+          Accept: 'application/json',
+        },
       },
-    },
-    10000,
-  );
+      10000,
+    );
 
-  if (!response.ok) {
-    throw new Error(`Reddit archive mirror returned HTTP ${response.status}.`);
+    if (response.status === 429 && attempt === 0) {
+      await sleep(1200);
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Reddit archive mirror returned HTTP ${response.status}.`);
+    }
+
+    const payload = (await response.json()) as { data?: RedditPostData[] };
+    return Array.isArray(payload.data) ? payload.data : [];
   }
 
-  const payload = (await response.json()) as { data?: RedditPostData[] };
-  return Array.isArray(payload.data) ? payload.data : [];
+  return [];
 }
 
 function parseRedditTarget(
@@ -480,7 +575,7 @@ export async function extractRedditUrl(
   cursor?: string,
   pageNumber = 1,
 ): Promise<{ job: ExtractionJob; items: MediaItem[] }> {
-  const safeLimit = Math.min(Math.max(Number(subredditLimit) || 25, 1), 100);
+  const safeLimit = Math.min(Math.max(Number(subredditLimit) || 25, 1), 500);
 
   try {
     const parsed = new URL(sourceUrl);
@@ -555,130 +650,227 @@ export async function extractRedditUrl(
       ? Number(cursor.slice(7))
       : undefined;
 
-    let posts: RedditPostData[] = [];
+    const items: MediaItem[] = [];
+    const seenPostIds = new Set<string>();
+    let mediaPostCount = 0;
     let resolverUsed = 'Reddit Public JSON';
     let nextCursor: string | undefined;
     let hasMore = false;
+    let directSucceeded = false;
 
-    // Tier 1: Direct Reddit JSON (skip if cursor explicitly belongs to Arctic Shift)
-    if (!arcticBeforeCursor) {
-      let jsonEndpoint = '';
-      const afterParam = redditAfterCursor
-        ? `&after=${encodeURIComponent(redditAfterCursor)}`
-        : '';
+    const processPostsBatch = async (
+      batch: RedditPostData[],
+      enforceLimit: boolean,
+    ): Promise<{ hitLimit: boolean; lastProcessedPost?: RedditPostData; hadRemaining: boolean }> => {
+      let lastProcessedPost: RedditPostData | undefined;
+      for (let i = 0; i < batch.length; i += 1) {
+        const post = batch[i];
+        lastProcessedPost = post;
+        if (post.id && seenPostIds.has(post.id)) continue;
+        if (post.id) seenPostIds.add(post.id);
 
-      if (target.kind === 'id') {
-        jsonEndpoint = `https://www.reddit.com/comments/${encodeURIComponent(target.value)}.json?raw_json=1`;
-      } else if (contentType === 'reddit_subreddit') {
-        const hasSort = /\/(hot|new|top|rising)$/i.test(cleanPath);
-        const sortSegment = hasSort ? '' : `/${subredditSort}`;
-        const topParam =
-          subredditSort === 'top' || cleanPath.endsWith('/top') ? '&t=month' : '';
-        jsonEndpoint = `https://www.reddit.com${cleanPath}${sortSegment}.json?limit=${Math.min(safeLimit, 100)}&raw_json=1${topParam}${afterParam}`;
-      } else if (contentType === 'reddit_user') {
-        const userPath = /\/submitted$/i.test(cleanPath)
-          ? cleanPath
-          : `${cleanPath}/submitted`;
-        const topParam = subredditSort === 'top' ? '&t=all' : '';
-        jsonEndpoint = `https://www.reddit.com${userPath}.json?sort=${subredditSort}&limit=${Math.min(safeLimit, 100)}&raw_json=1${topParam}${afterParam}`;
-      } else {
-        jsonEndpoint = `https://www.reddit.com${cleanPath}.json?raw_json=1`;
-      }
-
-      const directPayload = await fetchDirectRedditJson(jsonEndpoint);
-      if (Array.isArray(directPayload)) {
-        const children = (
-          directPayload[0] as {
-            data?: { children?: Array<{ data?: RedditPostData }> };
-          }
-        )?.data?.children;
-        const postData = children?.[0]?.data;
-        if (postData) posts = [postData];
-      } else if (directPayload && typeof directPayload === 'object') {
-        const listingData = (
-          directPayload as {
-            data?: {
-              after?: string | null;
-              children?: Array<{ data?: RedditPostData }>;
+        const extracted = await extractMediaFromPost(post, jobId, isFeed);
+        if (extracted.length > 0) {
+          items.push(...extracted);
+          mediaPostCount += 1;
+          if (enforceLimit && mediaPostCount >= safeLimit) {
+            return {
+              hitLimit: true,
+              lastProcessedPost,
+              hadRemaining: i < batch.length - 1,
             };
           }
-        )?.data;
-        if (Array.isArray(listingData?.children)) {
-          posts = listingData.children
-            .map((c) => c?.data)
-            .filter((p): p is RedditPostData => Boolean(p));
-          if (listingData.after) {
+        }
+      }
+      return { hitLimit: false, lastProcessedPost, hadRemaining: false };
+    };
+
+    // Tier 1: Direct Reddit JSON (multi-page walk for safeLimit > 100; skip if cursor belongs to Arctic Shift)
+    if (!arcticBeforeCursor) {
+      let currentAfter = redditAfterCursor;
+      const maxDirectPages = isFeed ? Math.min(Math.ceil(safeLimit / 80) + 2, 8) : 1;
+
+      for (let step = 0; step < maxDirectPages; step += 1) {
+        if (step > 0) await sleep(200);
+        let jsonEndpoint = '';
+        const afterParam = currentAfter
+          ? `&after=${encodeURIComponent(currentAfter)}`
+          : '';
+        const reqLimit = isFeed ? Math.min(Math.max(safeLimit - mediaPostCount, 25), 100) : 1;
+
+        if (target.kind === 'id') {
+          jsonEndpoint = `https://www.reddit.com/comments/${encodeURIComponent(target.value)}.json?raw_json=1`;
+        } else if (contentType === 'reddit_subreddit') {
+          const hasSort = /\/(hot|new|top|rising)$/i.test(cleanPath);
+          const sortSegment = hasSort ? '' : `/${subredditSort}`;
+          const topParam =
+            subredditSort === 'top' || cleanPath.endsWith('/top') ? '&t=month' : '';
+          jsonEndpoint = `https://www.reddit.com${cleanPath}${sortSegment}.json?limit=${reqLimit}&raw_json=1${topParam}${afterParam}`;
+        } else if (contentType === 'reddit_user') {
+          const userPath = /\/submitted$/i.test(cleanPath)
+            ? cleanPath
+            : `${cleanPath}/submitted`;
+          const topParam = subredditSort === 'top' ? '&t=all' : '';
+          jsonEndpoint = `https://www.reddit.com${userPath}.json?sort=${subredditSort}&limit=${reqLimit}&raw_json=1${topParam}${afterParam}`;
+        } else {
+          jsonEndpoint = `https://www.reddit.com${cleanPath}.json?raw_json=1`;
+        }
+
+        const directPayload = await fetchDirectRedditJson(jsonEndpoint);
+        if (!directPayload) break;
+        directSucceeded = true;
+
+        if (Array.isArray(directPayload)) {
+          const children = (
+            directPayload[0] as {
+              data?: { children?: Array<{ data?: RedditPostData }> };
+            }
+          )?.data?.children;
+          const postData = children?.[0]?.data;
+          if (postData) {
+            await processPostsBatch([postData], false);
+          }
+          break;
+        }
+
+        if (typeof directPayload === 'object') {
+          const listingData = (
+            directPayload as {
+              data?: {
+                after?: string | null;
+                children?: Array<{ data?: RedditPostData }>;
+              };
+            }
+          )?.data;
+
+          const pagePosts = Array.isArray(listingData?.children)
+            ? listingData.children
+                .map((c) => c?.data)
+                .filter((p): p is RedditPostData => Boolean(p))
+            : [];
+
+          if (pagePosts.length === 0) {
+            hasMore = false;
+            nextCursor = undefined;
+            break;
+          }
+
+          const { hitLimit, lastProcessedPost, hadRemaining } =
+            await processPostsBatch(pagePosts, isFeed);
+
+          // If we stopped mid-page at safeLimit, resume right after the last processed post
+          if (hitLimit && hadRemaining && lastProcessedPost?.id) {
+            nextCursor = `reddit:t3_${lastProcessedPost.id}`;
+            hasMore = true;
+            break;
+          }
+
+          if (listingData?.after) {
+            currentAfter = listingData.after;
             nextCursor = `reddit:${listingData.after}`;
             hasMore = true;
+          } else {
+            nextCursor = undefined;
+            hasMore = false;
+            break;
           }
+
+          if (hitLimit) break;
+        } else {
+          break;
         }
       }
     }
 
-    // Tier 2: Resilient Arctic Shift Public Index with multi-page walking & cursor pagination
-    if (posts.length === 0 && target.kind !== 'unknown' && target.value) {
+    // Tier 2: Resilient Arctic Shift Public Index with lossless multi-page walking & cursor pagination
+    if (!directSucceeded && target.kind !== 'unknown' && target.value) {
       resolverUsed = 'Reddit Public Index';
 
       if (target.kind === 'id') {
-        posts = await fetchArcticShiftPage({ kind: 'id', id: target.value }, 1);
+        const idPosts = await fetchArcticShiftPage({ kind: 'id', id: target.value }, 1);
+        await processPostsBatch(idPosts, false);
       } else {
-        const maxWalkPages = safeLimit > 50 ? 3 : safeLimit > 25 ? 2 : 1;
-        const batchSize = Math.min(Math.max(safeLimit * 2, 40), 100);
+        const batchSize = 100;
+        const maxWalkPages = Math.min(Math.max(Math.ceil(safeLimit / 60) + 2, 4), 10);
         let beforeUtc =
           arcticBeforeCursor && Number.isFinite(arcticBeforeCursor)
             ? arcticBeforeCursor
             : undefined;
-        let lastPageReturnedCount = 0;
+        let lastReturnedCount = 0;
 
         for (let step = 0; step < maxWalkPages; step += 1) {
-          if (step > 0) await sleep(250);
-          const pagePosts = await fetchArcticShiftPage(
-            target.kind === 'subreddit'
-              ? { kind: 'subreddit', name: target.value }
-              : { kind: 'user', name: target.value },
-            batchSize,
-            beforeUtc,
-          );
-          lastPageReturnedCount = pagePosts.length;
-          if (pagePosts.length === 0) break;
+          if (step > 0) await sleep(220);
+          let pagePosts: RedditPostData[];
+          try {
+            pagePosts = await fetchArcticShiftPage(
+              target.kind === 'subreddit'
+                ? { kind: 'subreddit', name: target.value }
+                : { kind: 'user', name: target.value },
+              batchSize,
+              beforeUtc,
+            );
+          } catch (stepErr) {
+            // Preserve all already-collected items & cursor if a later sub-page hits rate limit
+            if (items.length > 0 && beforeUtc) {
+              nextCursor = `arctic:${Math.floor(beforeUtc)}`;
+              hasMore = true;
+              break;
+            }
+            throw stepErr;
+          }
+          lastReturnedCount = pagePosts.length;
+          if (pagePosts.length === 0) {
+            hasMore = false;
+            nextCursor = undefined;
+            break;
+          }
 
-          posts.push(...pagePosts);
-          const oldestUtc = pagePosts.reduce<number | undefined>((min, p) => {
+          const { hitLimit, lastProcessedPost, hadRemaining } =
+            await processPostsBatch(pagePosts, true);
+
+          // Compute exact lossless chronological cursor from the last post we actually processed
+          const pageOldestUtc = pagePosts.reduce<number | undefined>((min, p) => {
             if (typeof p.created_utc !== 'number') return min;
             return min === undefined ? p.created_utc : Math.min(min, p.created_utc);
           }, undefined);
 
-          if (!oldestUtc || (beforeUtc !== undefined && oldestUtc >= beforeUtc)) {
+          const cursorAnchorUtc =
+            hitLimit &&
+            hadRemaining &&
+            typeof lastProcessedPost?.created_utc === 'number'
+              ? lastProcessedPost.created_utc
+              : pageOldestUtc;
+
+          if (
+            !cursorAnchorUtc ||
+            (beforeUtc !== undefined && cursorAnchorUtc >= beforeUtc)
+          ) {
+            hasMore = false;
+            nextCursor = undefined;
             break;
           }
-          beforeUtc = oldestUtc - 1;
-          if (pagePosts.length < batchSize) break;
-        }
 
-        if (beforeUtc && lastPageReturnedCount >= Math.min(batchSize, 15)) {
+          beforeUtc = cursorAnchorUtc - 1;
+
+          if (hitLimit) {
+            if (hadRemaining || lastReturnedCount >= 10) {
+              nextCursor = `arctic:${Math.floor(beforeUtc)}`;
+              hasMore = true;
+            }
+            break;
+          }
+
+          if (lastReturnedCount < batchSize) {
+            // Reached the end of available archived posts
+            hasMore = false;
+            nextCursor = undefined;
+            break;
+          }
+
+          // Still have more pages available on Arctic Shift
           nextCursor = `arctic:${Math.floor(beforeUtc)}`;
           hasMore = true;
         }
-
-        if (subredditSort === 'top' || subredditSort === 'hot') {
-          posts = [...posts].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-        }
-      }
-    }
-
-    const items: MediaItem[] = [];
-    const seenPostIds = new Set<string>();
-    let mediaPostCount = 0;
-
-    for (const post of posts) {
-      if (post.id && seenPostIds.has(post.id)) continue;
-      if (post.id) seenPostIds.add(post.id);
-
-      const extracted = await extractMediaFromPost(post, jobId, isFeed);
-      if (extracted.length > 0) {
-        items.push(...extracted);
-        mediaPostCount += 1;
-        if (isFeed && mediaPostCount >= safeLimit) break;
       }
     }
 
@@ -695,13 +887,17 @@ export async function extractRedditUrl(
               : contentType === 'reddit_user'
                 ? 'Reddit Public Profile'
                 : 'Reddit Post',
-          status: 'error',
-          message: cursor
-            ? 'No additional downloadable media found on the next page.'
-            : 'No downloadable photo, gallery, or video assets were found in this Reddit link (it may be text-only or private).',
+          status: hasMore && nextCursor ? 'ready' : 'error',
+          message:
+            hasMore && nextCursor
+              ? 'This page contained text-only posts. Click Load more to continue scanning.'
+              : cursor
+                ? 'No additional downloadable media found on the next page.'
+                : 'No downloadable photo, gallery, or video assets were found in this Reddit link (it may be text-only or private).',
           itemCount: 0,
           resolverUsed,
-          hasMore: false,
+          hasMore: isFeed ? hasMore : false,
+          nextCursor: isFeed ? nextCursor : undefined,
           pageNumber,
         },
         items: [],

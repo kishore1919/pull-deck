@@ -1,12 +1,9 @@
 import { useMemo, useRef, useState } from 'react';
 import {
   ArrowDownToLine,
-  Check,
   ChevronDown,
   ClipboardPaste,
-  Copy,
   FileUp,
-  KeyRound,
   Layers,
   Loader2,
   SlidersHorizontal,
@@ -27,10 +24,6 @@ interface IntakeRailProps {
   onModeChange: (mode: IntakeMode) => void;
   rawInput: string;
   onRawInputChange: (val: string) => void;
-  subredditLimit: number;
-  onSubredditLimitChange: (limit: number) => void;
-  subredditSort: 'hot' | 'top' | 'new';
-  onSubredditSortChange: (sort: 'hot' | 'top' | 'new') => void;
   zipOptions: ZipOptions;
   onZipOptionsChange: (options: ZipOptions) => void;
   isExtracting: boolean;
@@ -43,25 +36,19 @@ const PLATFORM_CONFIG: Record<
   {
     placeholder: string;
     bulkPlaceholder: string;
-    limits: number[];
-    supportsSort: boolean;
     examples: Array<{ label: string; input: string }>;
   }
 > = {
   instagram: {
-    placeholder: '@username, profile URL, post, reel, story, or highlight link',
+    placeholder: '@username, profile URL, post, or reel link',
     bulkPlaceholder:
-      'https://www.instagram.com/username/\nhttps://www.instagram.com/p/...\nhttps://www.instagram.com/stories/username/',
-    limits: [12, 25, 50, 100],
-    supportsSort: false,
+      'https://www.instagram.com/username/\nhttps://www.instagram.com/p/...\nhttps://www.instagram.com/reel/...',
     examples: [],
   },
   reddit: {
     placeholder: 'u/username, r/subreddit, or reddit.com post / profile URL',
     bulkPlaceholder:
       'https://www.reddit.com/r/EarthPorn\nhttps://www.reddit.com/user/nasa\nhttps://www.reddit.com/r/ArchitecturePorn',
-    limits: [25, 50, 100],
-    supportsSort: true,
     examples: [
       { label: 'r/EarthPorn', input: 'r/EarthPorn' },
       { label: 'u/nasa', input: 'u/nasa' },
@@ -71,19 +58,9 @@ const PLATFORM_CONFIG: Record<
     placeholder: 'username, redgifs.com/users/username, or clip URL',
     bulkPlaceholder:
       'https://www.redgifs.com/users/username\nhttps://www.redgifs.com/watch/...',
-    limits: [25, 50, 80],
-    supportsSort: true,
     examples: [],
   },
 };
-
-const IG_ENV_SNIPPET = `# Server Secrets (.env) for Instagram Stories, Highlights & Profiles
-INSTAGRAM_SESSION_ID="your_sessionid_cookie"
-INSTAGRAM_USERNAME="your_secondary_ig_handle"
-
-# Or managed RapidAPI connector:
-INSTAGRAM_RAPIDAPI_KEY="your_rapidapi_key"
-INSTAGRAM_RAPIDAPI_HOST="instagram-scraper-api2.p.rapidapi.com"`;
 
 function looksLikeExplicitUrl(val: string): boolean {
   return (
@@ -98,10 +75,6 @@ export function IntakeRail({
   onModeChange,
   rawInput,
   onRawInputChange,
-  subredditLimit,
-  onSubredditLimitChange,
-  subredditSort,
-  onSubredditSortChange,
   zipOptions,
   onZipOptionsChange,
   isExtracting,
@@ -109,15 +82,11 @@ export function IntakeRail({
   capabilities,
 }: IntakeRailProps) {
   const [optionsOpen, setOptionsOpen] = useState(false);
-  const [igSetupOpen, setIgSetupOpen] = useState(false);
-  const [copiedEnv, setCopiedEnv] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const maxBatchUrls = capabilities?.maxBatchUrls ?? 25;
 
   const config = PLATFORM_CONFIG[platform];
   const trimmedInput = rawInput.trim();
-  const effectiveLimit =
-    platform === 'redgifs' ? Math.min(subredditLimit, 80) : subredditLimit;
 
   const parsedState = useMemo(() => {
     if (mode === 'single') {
@@ -170,12 +139,6 @@ export function IntakeRail({
   }, [mode, platform, rawInput, trimmedInput, maxBatchUrls]);
 
   const invalidCount = parsedState.entries.filter((e) => !e.valid).length;
-  const sortDisplay =
-    subredditSort === 'new'
-      ? 'Latest'
-      : subredditSort === 'top'
-        ? 'Top'
-        : 'Hot';
 
   async function handlePasteFromClipboard() {
     try {
@@ -208,16 +171,6 @@ export function IntakeRail({
     };
     reader.readAsText(file);
     e.target.value = '';
-  }
-
-  async function handleCopyEnv() {
-    try {
-      await navigator.clipboard.writeText(IG_ENV_SNIPPET);
-      setCopiedEnv(true);
-      setTimeout(() => setCopiedEnv(false), 1800);
-    } catch {
-      // ignore
-    }
   }
 
   function handleSubmit(e: React.FormEvent) {
@@ -426,11 +379,7 @@ export function IntakeRail({
               className="inline-flex items-center gap-1.5 font-medium text-[#52525B] dark:text-[#D4D4D8] hover:text-[#09090B] dark:hover:text-[#FAFAFA] transition-colors whitespace-nowrap"
             >
               <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Options</span>
-              <span className="font-mono text-[#71717A] dark:text-[#A1A1AA] font-normal">
-                ({effectiveLimit}/page
-                {config.supportsSort ? ` · ${sortDisplay}` : ''})
-              </span>
+              <span>ZIP options</span>
               <ChevronDown
                 className={`w-3.5 h-3.5 transition-transform ${
                   optionsOpen ? 'rotate-180' : ''
@@ -438,23 +387,6 @@ export function IntakeRail({
                 aria-hidden="true"
               />
             </button>
-
-            {platform === 'instagram' && (
-              <button
-                type="button"
-                onClick={() => setIgSetupOpen((prev) => !prev)}
-                aria-expanded={igSetupOpen}
-                className="inline-flex items-center gap-1.5 font-medium text-[#52525B] dark:text-[#D4D4D8] hover:text-[#09090B] dark:hover:text-[#FAFAFA] transition-colors whitespace-nowrap"
-              >
-                <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>
-                  {capabilities?.instagramSessionConfigured ||
-                  capabilities?.instagramRapidApiConfigured
-                    ? 'Session active'
-                    : 'Session setup'}
-                </span>
-              </button>
-            )}
           </div>
 
           {config.examples.length > 0 && (
@@ -479,128 +411,37 @@ export function IntakeRail({
           )}
         </div>
 
-        {/* Collapsible Options Drawer */}
+        {/* Collapsible ZIP Format Drawer */}
         {optionsOpen && (
-          <div className="pt-3 border-t border-[#E4E4E7] dark:border-[#27272A] grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-            <div className="flex flex-col gap-1.5">
-              <span className="font-medium text-[#52525B] dark:text-[#A1A1AA]">
-                Per page
-              </span>
-              <div className="inline-flex items-center self-start p-0.5 bg-[#F4F4F5] dark:bg-[#18181B] rounded-md">
-                {config.limits.map((count) => (
-                  <button
-                    key={count}
-                    type="button"
-                    onClick={() => onSubredditLimitChange(count)}
-                    className={`px-2.5 py-1 font-mono tabular-nums rounded-xs transition-colors ${
-                      effectiveLimit === count
-                        ? 'bg-white dark:bg-[#27272A] text-[#09090B] dark:text-[#FAFAFA] shadow-xs font-medium'
-                        : 'text-[#52525B] dark:text-[#A1A1AA] hover:text-[#09090B] dark:hover:text-[#FAFAFA]'
-                    }`}
-                  >
-                    {count}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {config.supportsSort && (
-              <div className="flex flex-col gap-1.5">
-                <span className="font-medium text-[#52525B] dark:text-[#A1A1AA]">
-                  Sort
-                </span>
-                <div className="inline-flex items-center self-start p-0.5 bg-[#F4F4F5] dark:bg-[#18181B] rounded-md">
-                  {(
-                    [
-                      ['new', 'Latest'],
-                      ['top', 'Top'],
-                      ['hot', 'Hot'],
-                    ] as const
-                  ).map(([sortKey, sortLabel]) => (
-                    <button
-                      key={sortKey}
-                      type="button"
-                      onClick={() => onSubredditSortChange(sortKey)}
-                      className={`px-2.5 py-1 rounded-xs transition-colors ${
-                        subredditSort === sortKey
-                          ? 'bg-white dark:bg-[#27272A] text-[#09090B] dark:text-[#FAFAFA] shadow-xs font-medium'
-                          : 'text-[#52525B] dark:text-[#A1A1AA] hover:text-[#09090B] dark:hover:text-[#FAFAFA]'
-                      }`}
-                    >
-                      {sortLabel}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="flex flex-col gap-1.5">
-              <span className="font-medium text-[#52525B] dark:text-[#A1A1AA]">
-                ZIP format
-              </span>
-              <label className="inline-flex items-center gap-2 text-[#52525B] dark:text-[#D4D4D8] cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={zipOptions.organizeByFolder}
-                  onChange={(e) =>
-                    onZipOptionsChange({
-                      ...zipOptions,
-                      organizeByFolder: e.target.checked,
-                    })
-                  }
-                  className="w-3.5 h-3.5 rounded-xs border-[#D4D4D8] dark:border-[#3F3F46] accent-[#1D4ED8] dark:accent-[#3B82F6]"
-                />
-                <span>Group into profile folders</span>
-              </label>
-              <label className="inline-flex items-center gap-2 text-[#52525B] dark:text-[#D4D4D8] cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={zipOptions.includeMetadataJson}
-                  onChange={(e) =>
-                    onZipOptionsChange({
-                      ...zipOptions,
-                      includeMetadataJson: e.target.checked,
-                    })
-                  }
-                  className="w-3.5 h-3.5 rounded-xs border-[#D4D4D8] dark:border-[#3F3F46] accent-[#1D4ED8] dark:accent-[#3B82F6]"
-                />
-                <span>Include metadata.json</span>
-              </label>
-            </div>
-          </div>
-        )}
-
-        {/* Collapsible Instagram Server Session Setup (Instagram tab only) */}
-        {platform === 'instagram' && igSetupOpen && (
-          <div className="pt-3 border-t border-[#E4E4E7] dark:border-[#27272A] space-y-2 text-xs">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[#52525B] dark:text-[#A1A1AA]">
-                Add to server Secrets for Stories, Highlights & high-volume profiles
-                {capabilities?.instagramInstaloaderAvailable
-                  ? ` · Python Instaloader ${capabilities.instagramInstaloaderVersion || ''} ready`
-                  : ''}
-              </span>
-              <button
-                type="button"
-                onClick={handleCopyEnv}
-                className="inline-flex items-center gap-1 font-medium text-[#1D4ED8] dark:text-[#60A5FA] whitespace-nowrap"
-              >
-                {copiedEnv ? (
-                  <>
-                    <Check className="w-3.5 h-3.5" aria-hidden="true" />
-                    <span>Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" aria-hidden="true" />
-                    <span>Copy</span>
-                  </>
-                )}
-              </button>
-            </div>
-            <pre className="p-3 rounded-lg bg-[#FAFAFA] dark:bg-[#18181B] border border-[#E4E4E7] dark:border-[#27272A] font-mono text-[11px] leading-relaxed text-[#09090B] dark:text-[#E4E4E7] overflow-x-auto">
-              <code>{IG_ENV_SNIPPET}</code>
-            </pre>
+          <div className="pt-3 border-t border-[#E4E4E7] dark:border-[#27272A] flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
+            <label className="inline-flex items-center gap-2 text-[#52525B] dark:text-[#D4D4D8] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={zipOptions.organizeByFolder}
+                onChange={(e) =>
+                  onZipOptionsChange({
+                    ...zipOptions,
+                    organizeByFolder: e.target.checked,
+                  })
+                }
+                className="w-3.5 h-3.5 rounded-xs border-[#D4D4D8] dark:border-[#3F3F46] accent-[#1D4ED8] dark:accent-[#3B82F6]"
+              />
+              <span>Group into profile folders</span>
+            </label>
+            <label className="inline-flex items-center gap-2 text-[#52525B] dark:text-[#D4D4D8] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={zipOptions.includeMetadataJson}
+                onChange={(e) =>
+                  onZipOptionsChange({
+                    ...zipOptions,
+                    includeMetadataJson: e.target.checked,
+                  })
+                }
+                className="w-3.5 h-3.5 rounded-xs border-[#D4D4D8] dark:border-[#3F3F46] accent-[#1D4ED8] dark:accent-[#3B82F6]"
+              />
+              <span>Include metadata.json</span>
+            </label>
           </div>
         )}
       </form>
