@@ -264,10 +264,16 @@ export interface RedditDedupResult {
  * Uses Union-Find clustering and selects the EARLIEST original post (oldest createdAt)
  * in every cluster as the canonical representative.
  */
+export interface DedupOptions {
+  matchTitles?: boolean;
+}
+
 export function deduplicateRedditItems(
   items: MediaItem[],
   visualHashes: Map<string, bigint | null>,
+  options: DedupOptions = {},
 ): RedditDedupResult {
+  const matchTitles = options.matchTitles !== false;
   const n = items.length;
   const annotations = new Map<string, DuplicateAnnotation>();
   const hiddenDuplicateIds = new Set<string>();
@@ -366,30 +372,32 @@ export function deduplicateRedditItems(
   const byExactTitle = new Map<string, number[]>();
   const tokenBucketIndices: number[] = [];
 
-  for (let i = 0; i < n; i += 1) {
-    const norm = normalizeRedditTitle(items[i].title || '');
-    normalizedTitles[i] = norm;
-    const tokens = tokenizeTitle(norm);
-    titleTokens[i] = tokens;
+  if (matchTitles) {
+    for (let i = 0; i < n; i += 1) {
+      const norm = normalizeRedditTitle(items[i].title || '');
+      normalizedTitles[i] = norm;
+      const tokens = tokenizeTitle(norm);
+      titleTokens[i] = tokens;
 
-    // Require >= 10 chars and >= 2 meaningful words to avoid collapsing generic titles like "OC" or "Me"
-    if (norm.length >= 10 && tokens.length >= 2) {
-      const bucket = byExactTitle.get(norm);
-      if (bucket) {
-        for (const prevIdx of bucket) {
-          if (areMediaCompatible(items[prevIdx], items[i], 0.14, 2)) {
-            union(prevIdx, i, 'title');
-            break;
+      // Require >= 10 chars and >= 2 meaningful words to avoid collapsing generic titles like "OC" or "Me"
+      if (norm.length >= 10 && tokens.length >= 2) {
+        const bucket = byExactTitle.get(norm);
+        if (bucket) {
+          for (const prevIdx of bucket) {
+            if (areMediaCompatible(items[prevIdx], items[i], 0.14, 2)) {
+              union(prevIdx, i, 'title');
+              break;
+            }
           }
+          bucket.push(i);
+        } else {
+          byExactTitle.set(norm, [i]);
         }
-        bucket.push(i);
-      } else {
-        byExactTitle.set(norm, [i]);
       }
-    }
 
-    if (tokens.length >= 4) {
-      tokenBucketIndices.push(i);
+      if (tokens.length >= 4) {
+        tokenBucketIndices.push(i);
+      }
     }
   }
 

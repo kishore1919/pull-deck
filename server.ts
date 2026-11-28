@@ -21,7 +21,11 @@ import {
   ensureInstaloaderRuntime,
 } from './server/extractors/instaloaderBridge.ts';
 import { extractRedditUrl } from './server/extractors/reddit.ts';
-import { extractRedgifsUrl } from './server/extractors/redgifs.ts';
+import {
+  extractRedgifsClipById,
+  extractRedgifsIdFromUrl,
+  extractRedgifsUrl,
+} from './server/extractors/redgifs.ts';
 import {
   safeFetch,
   sanitizeFilename,
@@ -30,8 +34,8 @@ import {
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BATCH_URLS = 25;
-const MAX_ZIP_ITEMS = 50;
-const MAX_ZIP_VIDEO_ITEMS = 12;
+const MAX_ZIP_ITEMS = 60;
+const MAX_ZIP_VIDEO_ITEMS = 25;
 const MAX_PROFILE_LIMIT = 500;
 const PLATFORM_OPTIMAL_PAGE_SIZE = {
   reddit: 100,
@@ -39,6 +43,8 @@ const PLATFORM_OPTIMAL_PAGE_SIZE = {
   instagram: 30,
 } as const;
 const EXTRACT_CONCURRENCY = 4;
+const ZIP_FETCH_CONCURRENCY = 4;
+const ALREADY_COMPRESSED_EXT_RE = /\.(mp4|webm|jpg|jpeg|png|webp|gif)$/i;
 const ALLOWED_PROXY_CONTENT_TYPES = [
   'image/',
   'video/',
@@ -311,6 +317,10 @@ async function startServer() {
       return;
     }
 
+    // Prevent Node/Express idle timeout during multi-video HD ZIP assembly
+    req.setTimeout(5 * 60 * 1000);
+    res.setTimeout(5 * 60 * 1000);
+
     const items = body.items.slice(0, MAX_ZIP_ITEMS);
     const organizeByFolder = body.options?.organizeByFolder !== false;
     const includeMetadataJson = Boolean(body.options?.includeMetadataJson);
@@ -329,7 +339,7 @@ async function startServer() {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
 
-    const archive = new ZipArchive({ zlib: { level: 5 } });
+    const archive = new ZipArchive({ zlib: { level: 3 } });
     archive.on('error', () => {
       if (!res.headersSent) {
         res.status(500).json({ error: 'Failed while packaging ZIP stream.' });
@@ -346,41 +356,116 @@ async function startServer() {
     const MAX_TOTAL_ZIP_BYTES = 300 * 1024 * 1024;
     let totalBundledBytes = 0;
 
-    for (const item of items) {
-      try {
-        const { response } = await safeFetch(
-          item.mediaUrl,
-          'media',
-          {
-            headers: buildUpstreamMediaHeaders(item.mediaUrl),
-          },
-          15000,
-        );
+    async function fetchMediaBufferWithRetry(
+      item: ZipDownloadRequest['items'][number],
+    ): Promise<{ ok: true; buffer: Buffer } | { ok: false; reason: string }> {
+      let targetUrl = item.mediaUrl;
+      let refreshedRedgifs = false;
 
-        if (!response.ok || !response.body) {
-          skippedNotes.push(
-            `${item.filename}: upstream returned HTTP ${response.status}`,
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const { response } = await safeFetch(
+            targetUrl,
+            'media',
+            {
+              headers: buildUpstreamMediaHeaders(targetUrl),
+            },
+            35000,
           );
+
+          // RedGIFs CDN URLs have signed expiring tokens; refresh once via API if expired
+          if (
+            !response.ok &&
+            !refreshedRedgifs &&
+            (response.status === 401 ||
+              response.status === 403 ||
+              response.status === 404 ||
+              response.status === 410) &&
+            (item.platform === 'redgifs' || /redgifs\.com/i.test(item.sourceUrl || targetUrl))
+          ) {
+            await response.body?.cancel().catch(() => {});
+            refreshedRedgifs = true;
+            const gifId = extractRedgifsIdFromUrl(item.sourceUrl);
+            if (gifId) {
+              const fresh = await extractRedgifsClipById(gifId, 'zip-refresh');
+              if (fresh?.mediaUrl && fresh.mediaUrl !== targetUrl) {
+                targetUrl = fresh.mediaUrl;
+                continue;
+              }
+            }
+          }
+
+          if (!response.ok || !response.body) {
+            await response.body?.cancel().catch(() => {});
+            const retryable = response.status === 429 || response.status >= 500;
+            if (retryable && attempt === 0) {
+              await new Promise((r) => setTimeout(r, 600));
+              continue;
+            }
+            return { ok: false, reason: `upstream returned HTTP ${response.status}` };
+          }
+
+          const contentType = (response.headers.get('content-type') || '').toLowerCase();
+          const allowedType = ALLOWED_PROXY_CONTENT_TYPES.some((prefix) =>
+            contentType.startsWith(prefix),
+          );
+          if (!allowedType) {
+            await response.body?.cancel().catch(() => {});
+            return { ok: false, reason: 'unsupported upstream content-type' };
+          }
+
+          const declaredBytes = Number(response.headers.get('content-length') || 0);
+          if (declaredBytes > MAX_SINGLE_ZIP_FILE_BYTES) {
+            await response.body?.cancel().catch(() => {});
+            return { ok: false, reason: 'exceeded 80 MB single-file limit' };
+          }
+
+          const arrayBuf = await response.arrayBuffer();
+          if (arrayBuf.byteLength === 0) {
+            if (attempt === 0) {
+              await new Promise((r) => setTimeout(r, 400));
+              continue;
+            }
+            return { ok: false, reason: 'upstream returned empty body' };
+          }
+          if (arrayBuf.byteLength > MAX_SINGLE_ZIP_FILE_BYTES) {
+            return { ok: false, reason: 'exceeded 80 MB single-file limit' };
+          }
+          return { ok: true, buffer: Buffer.from(arrayBuf) };
+        } catch (err) {
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 600));
+            continue;
+          }
+          return {
+            ok: false,
+            reason: err instanceof Error ? err.message : 'fetch error',
+          };
+        }
+      }
+
+      return { ok: false, reason: 'upstream fetch failed' };
+    }
+
+    // Fetch media in bounded batches of 4 so RedGIFs HD video parts assemble rapidly without timeouts
+    for (let batchStart = 0; batchStart < items.length; batchStart += ZIP_FETCH_CONCURRENCY) {
+      if (res.destroyed) break;
+      const batch = items.slice(batchStart, batchStart + ZIP_FETCH_CONCURRENCY);
+      const fetched = await Promise.all(
+        batch.map(async (item) => ({
+          item,
+          result: await fetchMediaBufferWithRetry(item),
+        })),
+      );
+
+      for (const { item, result } of fetched) {
+        if (!result.ok) {
+          skippedNotes.push(`${item.filename}: ${result.reason}`);
           continue;
         }
 
-        const contentType = (response.headers.get('content-type') || '').toLowerCase();
-        const allowedType = ALLOWED_PROXY_CONTENT_TYPES.some((prefix) =>
-          contentType.startsWith(prefix),
-        );
-        if (!allowedType) {
-          await response.body.cancel().catch(() => {});
-          skippedNotes.push(`${item.filename}: unsupported upstream content-type`);
-          continue;
-        }
-
-        const declaredBytes = Number(response.headers.get('content-length') || 0);
-        if (
-          declaredBytes > MAX_SINGLE_ZIP_FILE_BYTES ||
-          totalBundledBytes + declaredBytes > MAX_TOTAL_ZIP_BYTES
-        ) {
-          await response.body.cancel().catch(() => {});
-          skippedNotes.push(`${item.filename}: exceeded bundle size limit`);
+        if (totalBundledBytes + result.buffer.byteLength > MAX_TOTAL_ZIP_BYTES) {
+          skippedNotes.push(`${item.filename}: exceeded 300 MB ZIP part limit`);
           continue;
         }
 
@@ -401,16 +486,12 @@ async function startServer() {
         }
         usedPaths.add(entryPath.toLowerCase());
 
-        const arrayBuf = await response.arrayBuffer();
-        if (
-          arrayBuf.byteLength > MAX_SINGLE_ZIP_FILE_BYTES ||
-          totalBundledBytes + arrayBuf.byteLength > MAX_TOTAL_ZIP_BYTES
-        ) {
-          skippedNotes.push(`${item.filename}: exceeded bundle size limit`);
-          continue;
-        }
-        totalBundledBytes += arrayBuf.byteLength;
-        archive.append(Buffer.from(arrayBuf), { name: entryPath });
+        totalBundledBytes += result.buffer.byteLength;
+        // Store already-compressed video/image formats uncompressed for ~8x faster ZIP streaming
+        archive.append(result.buffer, {
+          name: entryPath,
+          store: ALREADY_COMPRESSED_EXT_RE.test(entryPath),
+        });
 
         manifestEntries.push({
           archivePath: entryPath,
@@ -421,10 +502,6 @@ async function startServer() {
           mediaType: item.mediaType,
           sourceUrl: item.sourceUrl,
         });
-      } catch (err) {
-        skippedNotes.push(
-          `${item.filename}: ${err instanceof Error ? err.message : 'fetch error'}`,
-        );
       }
     }
 

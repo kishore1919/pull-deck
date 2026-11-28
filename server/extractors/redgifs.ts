@@ -142,6 +142,8 @@ function normalizeRedgifsNode(
       ? new Date(gif.createDate * 1000).toISOString()
       : undefined,
     hasAudioTrack: Boolean(gif.hasAudio),
+    postId: id,
+    canonicalMediaKey: `redgifs:${id}`,
   };
 }
 

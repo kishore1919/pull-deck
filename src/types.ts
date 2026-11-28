@@ -121,6 +121,18 @@ export interface ZipDownloadRequest {
   partLabel?: string;
 }
 
+export interface ZipPartDownloadItem {
+  partNumber: number;
+  totalParts: number;
+  fileCount: number;
+  filename: string;
+  status: 'pending' | 'building' | 'downloaded' | 'error';
+  blobUrl?: string;
+  sizeBytes?: number;
+  error?: string;
+  items: MediaItem[];
+}
+
 export interface CapabilitiesResponse {
   redditPublic: boolean;
   redgifsPublic: boolean;

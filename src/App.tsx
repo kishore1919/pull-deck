@@ -8,6 +8,7 @@ import type {
   MediaItem,
   Platform,
   ZipOptions,
+  ZipPartDownloadItem,
 } from './types';
 import { TopBar } from './components/TopBar';
 import { IntakeRail, type IntakeMode } from './components/IntakeRail';
@@ -51,6 +52,10 @@ function itemSubmissionKey(item: MediaItem, jobPlatform: Platform | null): strin
   if (effectivePlatform === 'reddit') {
     const postKey = item.postId || item.sourceUrl;
     return `reddit::${postKey}::${item.indexInGroup}::${item.mediaUrl}`;
+  }
+  if (effectivePlatform === 'redgifs') {
+    const clipKey = item.postId || item.sourceUrl;
+    return `redgifs::${clipKey}::${item.mediaUrl}`;
   }
   return item.mediaUrl;
 }
@@ -108,13 +113,16 @@ export default function App() {
   const [items, setItems] = useState<MediaItem[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  // Reddit multi-signal deduplication state (strictly in-memory)
-  const [showRedditDuplicates, setShowRedditDuplicates] = useState(false);
+  // Multi-signal deduplication state for Reddit & RedGIFs (strictly in-memory)
+  const [showDuplicatesByPlatform, setShowDuplicatesByPlatform] = useState<
+    Record<'reddit' | 'redgifs', boolean>
+  >({ reddit: false, redgifs: false });
   const [visualHashes, setVisualHashes] = useState<Map<string, bigint | null>>(
     () => new Map(),
   );
   const hashedIdsRef = useRef<Set<string>>(new Set());
   const inFlightHashIdsRef = useRef<Set<string>>(new Set());
+  const autoDeselectedDupIdsRef = useRef<Set<string>>(new Set());
 
   const [typeFilter, setTypeFilter] = useState<MediaTypeFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -129,11 +137,27 @@ export default function App() {
 
   const [isBundlingZip, setIsBundlingZip] = useState(false);
   const [zipProgressLabel, setZipProgressLabel] = useState<string | null>(null);
+  const [zipParts, setZipParts] = useState<ZipPartDownloadItem[]>([]);
+  const [zipPartsPlatform, setZipPartsPlatform] = useState<Platform | null>(null);
+  const stopZipRef = useRef(false);
+  const zipPartsRef = useRef<ZipPartDownloadItem[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
 
-  const maxZipImages = capabilities?.maxZipItems ?? 50;
-  const maxZipVideos = capabilities?.maxZipVideoItems ?? 12;
+  const maxZipImages = capabilities?.maxZipItems ?? 60;
+  const maxZipVideos = capabilities?.maxZipVideoItems ?? 25;
+
+  useEffect(() => {
+    zipPartsRef.current = zipParts;
+  }, [zipParts]);
+
+  useEffect(() => {
+    return () => {
+      for (const part of zipPartsRef.current) {
+        if (part.blobUrl) URL.revokeObjectURL(part.blobUrl);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
@@ -181,14 +205,33 @@ export default function App() {
     [items, jobPlatformById],
   );
 
+  const redgifsItems = useMemo(
+    () =>
+      items.filter((item) => {
+        const jobPlatform = jobPlatformById.get(item.jobId);
+        return (jobPlatform || item.platform) === 'redgifs';
+      }),
+    [items, jobPlatformById],
+  );
+
   const redditDedup = useMemo(
-    () => deduplicateRedditItems(redditItems, visualHashes),
+    () => deduplicateRedditItems(redditItems, visualHashes, { matchTitles: true }),
     [redditItems, visualHashes],
   );
 
-  // Progressive background visual thumbnail hashing (Layer 3 dHash) for Reddit items
+  const redgifsDedup = useMemo(
+    () => deduplicateRedditItems(redgifsItems, visualHashes, { matchTitles: false }),
+    [redgifsItems, visualHashes],
+  );
+
+  const dedupEligibleItems = useMemo(
+    () => [...redditItems, ...redgifsItems],
+    [redditItems, redgifsItems],
+  );
+
+  // Progressive background visual thumbnail hashing (Layer 3 dHash) for Reddit & RedGIFs
   useEffect(() => {
-    const hashable = redditItems.filter(
+    const hashable = dedupEligibleItems.filter(
       (item) =>
         canHashItemThumbnail(item) &&
         !hashedIdsRef.current.has(item.id) &&
@@ -245,48 +288,75 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [redditItems]);
+  }, [dedupEligibleItems]);
 
-  const redditVisualScanProgress = useMemo(() => {
-    const hashableTotal = redditItems.filter(canHashItemThumbnail).length;
+  const activeVisualScanProgress = useMemo(() => {
+    const targetItems =
+      activePlatform === 'reddit'
+        ? redditItems
+        : activePlatform === 'redgifs'
+          ? redgifsItems
+          : [];
+    const hashableTotal = targetItems.filter(canHashItemThumbnail).length;
     if (hashableTotal <= 1) return null;
     let scanned = 0;
-    for (const item of redditItems) {
+    for (const item of targetItems) {
       if (canHashItemThumbnail(item) && visualHashes.has(item.id)) {
         scanned += 1;
       }
     }
     if (scanned >= hashableTotal) return null;
     return { scanned, total: hashableTotal };
-  }, [redditItems, visualHashes]);
+  }, [activePlatform, redditItems, redgifsItems, visualHashes]);
 
-  // Keep selection synced with earliest-original promotion & hidden duplicate exclusion
+  // Guarantee single-copy earliest-original selection on BOTH Reddit and RedGIFs
   useEffect(() => {
-    if (redditItems.length === 0) return;
+    if (redditItems.length === 0 && redgifsItems.length === 0) return;
 
     setSelectedIds((prev) => {
       let changed = false;
       const next = new Set(prev);
 
-      for (const [itemId, ann] of redditDedup.annotations.entries()) {
-        if (!ann.isDuplicate) continue;
-        if (next.has(itemId)) {
-          // Transfer selection to the true earliest original when superseded
-          if (!next.has(ann.canonicalId)) {
-            next.add(ann.canonicalId);
-            changed = true;
+      const syncPlatformDedup = (
+        annotations: Map<string, { isDuplicate: boolean; canonicalId: string }>,
+        showDups: boolean,
+      ) => {
+        for (const [itemId, ann] of annotations.entries()) {
+          if (!ann.isDuplicate) {
+            autoDeselectedDupIdsRef.current.delete(itemId);
+            continue;
           }
-          // When duplicates are hidden, remove hidden duplicate IDs from active selection
-          if (!showRedditDuplicates) {
-            next.delete(itemId);
-            changed = true;
+          if (next.has(itemId)) {
+            // Always keep the single earliest original selected when a repeat is grouped
+            if (!next.has(ann.canonicalId)) {
+              next.add(ann.canonicalId);
+              changed = true;
+            }
+            // Deselect hidden duplicates always, and auto-deselect newly detected duplicates
+            // even if Show Duplicates is toggled on (user can still opt-in manually afterwards)
+            if (!showDups || !autoDeselectedDupIdsRef.current.has(itemId)) {
+              next.delete(itemId);
+              autoDeselectedDupIdsRef.current.add(itemId);
+              changed = true;
+            }
+          } else {
+            autoDeselectedDupIdsRef.current.add(itemId);
           }
         }
-      }
+      };
+
+      syncPlatformDedup(redditDedup.annotations, showDuplicatesByPlatform.reddit);
+      syncPlatformDedup(redgifsDedup.annotations, showDuplicatesByPlatform.redgifs);
 
       return changed ? next : prev;
     });
-  }, [redditDedup, redditItems.length, showRedditDuplicates]);
+  }, [
+    redditDedup,
+    redgifsDedup,
+    redditItems.length,
+    redgifsItems.length,
+    showDuplicatesByPlatform,
+  ]);
 
   const countsByPlatform = useMemo(() => {
     const counts: Record<Platform, number> = {
@@ -298,15 +368,28 @@ export default function App() {
       const target = jobPlatformById.get(item.jobId) || item.platform;
       if (
         target === 'reddit' &&
-        !showRedditDuplicates &&
+        !showDuplicatesByPlatform.reddit &&
         redditDedup.hiddenDuplicateIds.has(item.id)
+      ) {
+        continue;
+      }
+      if (
+        target === 'redgifs' &&
+        !showDuplicatesByPlatform.redgifs &&
+        redgifsDedup.hiddenDuplicateIds.has(item.id)
       ) {
         continue;
       }
       counts[target] += 1;
     }
     return counts;
-  }, [items, jobPlatformById, showRedditDuplicates, redditDedup.hiddenDuplicateIds]);
+  }, [
+    items,
+    jobPlatformById,
+    showDuplicatesByPlatform,
+    redditDedup.hiddenDuplicateIds,
+    redgifsDedup.hiddenDuplicateIds,
+  ]);
 
   const activePlatformItems = useMemo(
     () =>
@@ -316,8 +399,15 @@ export default function App() {
         if (resolvedPlatform !== activePlatform) return false;
         if (
           activePlatform === 'reddit' &&
-          !showRedditDuplicates &&
+          !showDuplicatesByPlatform.reddit &&
           redditDedup.hiddenDuplicateIds.has(item.id)
+        ) {
+          return false;
+        }
+        if (
+          activePlatform === 'redgifs' &&
+          !showDuplicatesByPlatform.redgifs &&
+          redgifsDedup.hiddenDuplicateIds.has(item.id)
         ) {
           return false;
         }
@@ -327,8 +417,9 @@ export default function App() {
       items,
       jobPlatformById,
       activePlatform,
-      showRedditDuplicates,
+      showDuplicatesByPlatform,
       redditDedup.hiddenDuplicateIds,
+      redgifsDedup.hiddenDuplicateIds,
     ],
   );
 
@@ -720,17 +811,22 @@ export default function App() {
         .map((i) => i.id),
     );
 
-    if (activePlatform === 'reddit') {
-      setShowRedditDuplicates(false);
+    if (activePlatform === 'reddit' || activePlatform === 'redgifs') {
+      setShowDuplicatesByPlatform((prev) => ({ ...prev, [activePlatform]: false }));
       allIdsForPlatform.forEach((id) => {
         hashedIdsRef.current.delete(id);
         inFlightHashIdsRef.current.delete(id);
+        autoDeselectedDupIdsRef.current.delete(id);
       });
       setVisualHashes((prev) => {
         const next = new Map(prev);
         allIdsForPlatform.forEach((id) => next.delete(id));
         return next;
       });
+    }
+
+    if (zipPartsPlatform === activePlatform) {
+      clearZipParts();
     }
 
     setInputsByPlatform((prev) => ({ ...prev, [activePlatform]: '' }));
@@ -778,6 +874,114 @@ export default function App() {
     );
   }
 
+  function triggerBlobDownload(blobUrl: string, filename: string) {
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  function clearZipParts() {
+    stopZipRef.current = true;
+    for (const part of zipPartsRef.current) {
+      if (part.blobUrl) URL.revokeObjectURL(part.blobUrl);
+    }
+    setZipParts([]);
+    setZipPartsPlatform(null);
+  }
+
+  async function buildZipPartBlob(
+    chunk: MediaItem[],
+    partLabel?: string,
+  ): Promise<Blob> {
+    const response = await fetch('/api/download/zip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        items: chunk.map((item) => ({
+          id: item.id,
+          platform: item.platform,
+          sourceContainer: item.sourceContainer,
+          author: item.author,
+          title: item.title,
+          mediaUrl: item.mediaUrl,
+          sourceUrl: item.sourceUrl,
+          filename: item.filename,
+          mediaType: item.mediaType,
+        })),
+        options: zipOptions,
+        partLabel,
+      }),
+    });
+
+    if (!response.ok) {
+      const errPayload = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
+      throw new Error(errPayload.error || `ZIP bundling failed (${response.status})`);
+    }
+
+    return response.blob();
+  }
+
+  function handleSaveZipPart(partNumber: number) {
+    const part = zipPartsRef.current.find((p) => p.partNumber === partNumber);
+    if (!part?.blobUrl) return;
+    triggerBlobDownload(part.blobUrl, part.filename);
+    showToast('success', `Saved ${part.filename}`);
+  }
+
+  async function handleRetryZipPart(partNumber: number) {
+    const part = zipPartsRef.current.find((p) => p.partNumber === partNumber);
+    if (!part || isBundlingZip) return;
+
+    setIsBundlingZip(true);
+    setZipProgressLabel(`Retrying Part ${part.partNumber}/${part.totalParts}...`);
+    setZipParts((prev) =>
+      prev.map((p) =>
+        p.partNumber === partNumber
+          ? { ...p, status: 'building', error: undefined }
+          : p,
+      ),
+    );
+
+    try {
+      const blob = await buildZipPartBlob(
+        part.items,
+        `part-${part.partNumber}-of-${part.totalParts}`,
+      );
+      const blobUrl = URL.createObjectURL(blob);
+      setZipParts((prev) =>
+        prev.map((p) => {
+          if (p.partNumber !== partNumber) return p;
+          if (p.blobUrl) URL.revokeObjectURL(p.blobUrl);
+          return {
+            ...p,
+            status: 'downloaded',
+            blobUrl,
+            sizeBytes: blob.size,
+            error: undefined,
+          };
+        }),
+      );
+      triggerBlobDownload(blobUrl, part.filename);
+      showToast('success', `Part ${part.partNumber} ready and downloaded.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Retry failed';
+      setZipParts((prev) =>
+        prev.map((p) =>
+          p.partNumber === partNumber ? { ...p, status: 'error', error: msg } : p,
+        ),
+      );
+      showToast('error', `Part ${part.partNumber}: ${msg}`);
+    } finally {
+      setIsBundlingZip(false);
+      setZipProgressLabel(null);
+    }
+  }
+
   async function handleDownloadZip() {
     if (activeSelectedItems.length === 0 || isBundlingZip) return;
 
@@ -787,81 +991,117 @@ export default function App() {
       maxZipVideos,
     );
 
+    // Clear previous part queue and revoke old blob URLs
+    clearZipParts();
+    stopZipRef.current = false;
     setIsBundlingZip(true);
 
-    try {
-      for (let partIdx = 0; partIdx < chunks.length; partIdx += 1) {
-        const chunk = chunks[partIdx];
-        const partNumber = partIdx + 1;
-        const isMultiPart = chunks.length > 1;
-        const partLabel = isMultiPart
-          ? `part-${partNumber}-of-${chunks.length}`
-          : undefined;
+    // Single ZIP fast path
+    if (chunks.length === 1) {
+      const chunk = chunks[0];
+      setZipProgressLabel('Packaging ZIP...');
+      try {
+        const blob = await buildZipPartBlob(chunk);
+        const blobUrl = URL.createObjectURL(blob);
+        const filename = `pulldeck-${activePlatform}-${chunk.length}-files.zip`;
+        triggerBlobDownload(blobUrl, filename);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+        showToast(
+          'success',
+          `Downloaded ZIP (${chunk.length} ${chunk.length === 1 ? 'file' : 'files'}).`,
+        );
+      } catch (err) {
+        showToast(
+          'error',
+          err instanceof Error ? err.message : 'Failed to build ZIP bundle.',
+        );
+      } finally {
+        setIsBundlingZip(false);
+        setZipProgressLabel(null);
+      }
+      return;
+    }
 
-        setZipProgressLabel(
-          isMultiPart
-            ? `ZIP Part ${partNumber}/${chunks.length}...`
-            : 'Packaging ZIP...',
+    // Multi-Part ZIP Queue: builds all parts, keeps Blobs in memory for 0ms 1-click save
+    // so browser/iframe automatic multi-download blocks NEVER lose parts 3..N
+    const targetPlatform = activePlatform;
+    const initialParts: ZipPartDownloadItem[] = chunks.map((chunk, idx) => ({
+      partNumber: idx + 1,
+      totalParts: chunks.length,
+      fileCount: chunk.length,
+      filename: `pulldeck-${targetPlatform}-part-${idx + 1}-of-${chunks.length}.zip`,
+      status: 'pending',
+      items: chunk,
+    }));
+
+    setZipPartsPlatform(targetPlatform);
+    setZipParts(initialParts);
+
+    let completedCount = 0;
+    let failedCount = 0;
+
+    try {
+      for (let partIdx = 0; partIdx < initialParts.length; partIdx += 1) {
+        if (stopZipRef.current) break;
+        const part = initialParts[partIdx];
+        const partNumber = part.partNumber;
+
+        setZipProgressLabel(`ZIP Part ${partNumber}/${chunks.length}...`);
+        setZipParts((prev) =>
+          prev.map((p) =>
+            p.partNumber === partNumber ? { ...p, status: 'building' } : p,
+          ),
         );
 
-        const response = await fetch('/api/download/zip', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            items: chunk.map((item) => ({
-              id: item.id,
-              platform: item.platform,
-              sourceContainer: item.sourceContainer,
-              author: item.author,
-              title: item.title,
-              mediaUrl: item.mediaUrl,
-              sourceUrl: item.sourceUrl,
-              filename: item.filename,
-              mediaType: item.mediaType,
-            })),
-            options: zipOptions,
-            partLabel,
-          }),
-        });
-
-        if (!response.ok) {
-          const errPayload = (await response.json().catch(() => ({}))) as {
-            error?: string;
-          };
-          throw new Error(
-            errPayload.error ||
-              `ZIP bundling failed on part ${partNumber} (${response.status})`,
+        try {
+          const blob = await buildZipPartBlob(
+            part.items,
+            `part-${partNumber}-of-${chunks.length}`,
           );
-        }
+          if (stopZipRef.current) break;
 
-        const blob = await response.blob();
-        const blobUrl = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = blobUrl;
-        a.download = isMultiPart
-          ? `pulldeck-${activePlatform}-part-${partNumber}-of-${chunks.length}.zip`
-          : `pulldeck-${activePlatform}-${chunk.length}-files.zip`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 8000);
+          const blobUrl = URL.createObjectURL(blob);
+          setZipParts((prev) =>
+            prev.map((p) =>
+              p.partNumber === partNumber
+                ? { ...p, status: 'downloaded', blobUrl, sizeBytes: blob.size }
+                : p,
+            ),
+          );
+          triggerBlobDownload(blobUrl, part.filename);
+          completedCount += 1;
 
-        if (partIdx < chunks.length - 1) {
-          await new Promise((r) => setTimeout(r, 450));
+          // Space out automatic downloads to avoid browser burst throttling
+          if (partIdx < initialParts.length - 1 && !stopZipRef.current) {
+            await new Promise((r) => setTimeout(r, 1600));
+          }
+        } catch (err) {
+          failedCount += 1;
+          const msg = err instanceof Error ? err.message : 'Packaging failed';
+          setZipParts((prev) =>
+            prev.map((p) =>
+              p.partNumber === partNumber ? { ...p, status: 'error', error: msg } : p,
+            ),
+          );
         }
       }
 
-      showToast(
-        'success',
-        chunks.length > 1
-          ? `Downloaded ${chunks.length} ZIP parts (${activeSelectedItems.length} files).`
-          : `Downloaded ZIP (${activeSelectedItems.length} ${activeSelectedItems.length === 1 ? 'file' : 'files'}).`,
-      );
-    } catch (err) {
-      showToast(
-        'error',
-        err instanceof Error ? err.message : 'Failed to build ZIP bundle.',
-      );
+      if (stopZipRef.current) {
+        showToast(
+          'success',
+          `Stopped after packaging ${completedCount} of ${chunks.length} ZIP parts.`,
+        );
+      } else if (failedCount > 0) {
+        showToast(
+          'error',
+          `Packaged ${completedCount}/${chunks.length} ZIP parts (${failedCount} failed — click Retry on failed parts).`,
+        );
+      } else {
+        showToast(
+          'success',
+          `All ${chunks.length} ZIP parts ready (${activeSelectedItems.length} files). Click any part button if your browser blocked auto-save.`,
+        );
+      }
     } finally {
       setIsBundlingZip(false);
       setZipProgressLabel(null);
@@ -919,24 +1159,45 @@ export default function App() {
           isBundlingZip={isBundlingZip}
           zipProgressLabel={zipProgressLabel}
           zipPartCount={activeZipPartCount}
+          zipParts={zipPartsPlatform === activePlatform ? zipParts : []}
+          onSaveZipPart={handleSaveZipPart}
+          onRetryZipPart={handleRetryZipPart}
+          onStopZip={() => {
+            stopZipRef.current = true;
+          }}
+          onDismissZipParts={clearZipParts}
           selectedCount={activeSelectedItems.length}
           duplicateAnnotations={
-            activePlatform === 'reddit' ? redditDedup.annotations : undefined
+            activePlatform === 'reddit'
+              ? redditDedup.annotations
+              : activePlatform === 'redgifs'
+                ? redgifsDedup.annotations
+                : undefined
           }
           duplicateCount={
-            activePlatform === 'reddit' ? redditDedup.duplicateCount : 0
+            activePlatform === 'reddit'
+              ? redditDedup.duplicateCount
+              : activePlatform === 'redgifs'
+                ? redgifsDedup.duplicateCount
+                : 0
           }
           showDuplicates={
-            activePlatform === 'reddit' ? showRedditDuplicates : false
+            activePlatform === 'reddit'
+              ? showDuplicatesByPlatform.reddit
+              : activePlatform === 'redgifs'
+                ? showDuplicatesByPlatform.redgifs
+                : false
           }
           onToggleShowDuplicates={
-            activePlatform === 'reddit'
-              ? () => setShowRedditDuplicates((prev) => !prev)
+            activePlatform === 'reddit' || activePlatform === 'redgifs'
+              ? () =>
+                  setShowDuplicatesByPlatform((prev) => ({
+                    ...prev,
+                    [activePlatform]: !prev[activePlatform],
+                  }))
               : undefined
           }
-          visualScanProgress={
-            activePlatform === 'reddit' ? redditVisualScanProgress : null
-          }
+          visualScanProgress={activeVisualScanProgress}
           onToggleSelect={handleToggleSelect}
           onSelectVisible={handleSelectVisible}
           onDeselectPlatform={handleDeselectPlatform}

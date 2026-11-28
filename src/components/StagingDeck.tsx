@@ -16,6 +16,7 @@ import {
   Search,
   Square,
   Trash2,
+  X,
 } from 'lucide-react';
 import type {
   DuplicateAnnotation,
@@ -23,6 +24,7 @@ import type {
   ExtractionJob,
   MediaItem,
   Platform,
+  ZipPartDownloadItem,
 } from '../types';
 import { MediaThumbnail } from './MediaThumbnail';
 
@@ -64,6 +66,11 @@ interface StagingDeckProps {
   isBundlingZip: boolean;
   zipProgressLabel: string | null;
   zipPartCount: number;
+  zipParts?: ZipPartDownloadItem[];
+  onSaveZipPart?: (partNumber: number) => void;
+  onRetryZipPart?: (partNumber: number) => void;
+  onStopZip?: () => void;
+  onDismissZipParts?: () => void;
   selectedCount: number;
   duplicateAnnotations?: Map<string, DuplicateAnnotation>;
   duplicateCount?: number;
@@ -82,6 +89,14 @@ interface StagingDeckProps {
   onLoadMore: (job: ExtractionJob) => void;
   onLoadAll: (job: ExtractionJob) => void;
   onStopLoadAll: () => void;
+}
+
+function formatByteSize(bytes?: number): string {
+  if (!bytes || bytes <= 0) return '';
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 function formatContentLabel(item: MediaItem): string {
@@ -120,6 +135,11 @@ export function StagingDeck({
   isBundlingZip,
   zipProgressLabel,
   zipPartCount,
+  zipParts = [],
+  onSaveZipPart,
+  onRetryZipPart,
+  onStopZip,
+  onDismissZipParts,
   selectedCount,
   duplicateAnnotations,
   duplicateCount = 0,
@@ -368,24 +388,26 @@ export function StagingDeck({
                 </span>
               )}
 
-              {platform === 'reddit' && duplicateCount > 0 && onToggleShowDuplicates && (
-                <button
-                  type="button"
-                  onClick={onToggleShowDuplicates}
-                  aria-pressed={showDuplicates}
-                  className={`px-2.5 py-1 text-xs font-mono tabular-nums rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                    showDuplicates
-                      ? 'bg-[#EFF6FF] dark:bg-[#1E3A8A]/30 border-[#1D4ED8]/40 dark:border-[#3B82F6]/40 text-[#1D4ED8] dark:text-[#60A5FA]'
-                      : 'bg-[#FAFAFA] dark:bg-[#18181B] border-[#E4E4E7] dark:border-[#27272A] text-[#52525B] dark:text-[#D4D4D8] hover:border-[#1D4ED8] dark:hover:border-[#3B82F6] hover:text-[#1D4ED8] dark:hover:text-[#60A5FA]'
-                  }`}
-                >
-                  {showDuplicates
-                    ? `Showing ${duplicateCount} ${duplicateCount === 1 ? 'duplicate' : 'duplicates'} · Hide`
-                    : `${duplicateCount} ${duplicateCount === 1 ? 'duplicate' : 'duplicates'} hidden · Show`}
-                </button>
-              )}
+              {(platform === 'reddit' || platform === 'redgifs') &&
+                duplicateCount > 0 &&
+                onToggleShowDuplicates && (
+                  <button
+                    type="button"
+                    onClick={onToggleShowDuplicates}
+                    aria-pressed={showDuplicates}
+                    className={`px-2.5 py-1 text-xs font-mono tabular-nums rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                      showDuplicates
+                        ? 'bg-[#EFF6FF] dark:bg-[#1E3A8A]/30 border-[#1D4ED8]/40 dark:border-[#3B82F6]/40 text-[#1D4ED8] dark:text-[#60A5FA]'
+                        : 'bg-[#FAFAFA] dark:bg-[#18181B] border-[#E4E4E7] dark:border-[#27272A] text-[#52525B] dark:text-[#D4D4D8] hover:border-[#1D4ED8] dark:hover:border-[#3B82F6] hover:text-[#1D4ED8] dark:hover:text-[#60A5FA]'
+                    }`}
+                  >
+                    {showDuplicates
+                      ? `Showing ${duplicateCount} ${duplicateCount === 1 ? 'duplicate' : 'duplicates'} · Hide`
+                      : `${duplicateCount} ${duplicateCount === 1 ? 'duplicate' : 'duplicates'} hidden · Show`}
+                  </button>
+                )}
 
-              {platform === 'reddit' && visualScanProgress && (
+              {(platform === 'reddit' || platform === 'redgifs') && visualScanProgress && (
                 <span className="inline-flex items-center gap-1.5 text-xs font-mono tabular-nums text-[#71717A] dark:text-[#A1A1AA] whitespace-nowrap">
                   <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
                   <span>
@@ -445,6 +467,97 @@ export function StagingDeck({
               </div>
             </div>
           </div>
+
+          {/* Interactive Multi-Part ZIP Queue (prevents browser/iframe multi-download blocks from losing parts) */}
+          {zipParts.length > 1 && (
+            <div className="pt-3 border-t border-[#F4F4F5] dark:border-[#27272A] flex flex-col gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="text-[#52525B] dark:text-[#A1A1AA]">
+                  ZIP parts ready — click any part below if your browser blocked automatic multi-file downloads.
+                </span>
+                <div className="flex items-center gap-3 shrink-0">
+                  {isBundlingZip && onStopZip && (
+                    <button
+                      type="button"
+                      onClick={onStopZip}
+                      className="inline-flex items-center gap-1 font-medium text-[#B91C1C] dark:text-[#F87171] hover:underline whitespace-nowrap"
+                    >
+                      <Square className="w-3 h-3 fill-current" aria-hidden="true" />
+                      <span>Stop</span>
+                    </button>
+                  )}
+                  {!isBundlingZip && onDismissZipParts && (
+                    <button
+                      type="button"
+                      onClick={onDismissZipParts}
+                      aria-label="Dismiss ZIP parts bar"
+                      className="inline-flex items-center gap-1 text-[#71717A] dark:text-[#A1A1AA] hover:text-[#09090B] dark:hover:text-[#FAFAFA] whitespace-nowrap"
+                    >
+                      <X className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>Close</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {zipParts.map((part) => {
+                  const sizeText = formatByteSize(part.sizeBytes);
+                  if (part.status === 'downloaded' && part.blobUrl) {
+                    return (
+                      <button
+                        key={part.partNumber}
+                        type="button"
+                        onClick={() => onSaveZipPart?.(part.partNumber)}
+                        title={`Save ${part.filename}`}
+                        className="h-8 px-2.5 inline-flex items-center gap-1.5 text-xs font-mono tabular-nums rounded-md border border-[#E4E4E7] dark:border-[#27272A] bg-[#FAFAFA] dark:bg-[#18181B] text-[#09090B] dark:text-[#FAFAFA] hover:border-[#1D4ED8] dark:hover:border-[#3B82F6] hover:text-[#1D4ED8] dark:hover:text-[#60A5FA] transition-colors whitespace-nowrap shrink-0"
+                      >
+                        <Download className="w-3 h-3 text-[#15803D] dark:text-[#4ADE80]" aria-hidden="true" />
+                        <span>
+                          Part {part.partNumber} ({part.fileCount}
+                          {sizeText ? ` · ${sizeText}` : ''})
+                        </span>
+                      </button>
+                    );
+                  }
+                  if (part.status === 'building') {
+                    return (
+                      <span
+                        key={part.partNumber}
+                        className="h-8 px-2.5 inline-flex items-center gap-1.5 text-xs font-mono tabular-nums rounded-md border border-[#1D4ED8]/40 dark:border-[#3B82F6]/40 bg-[#EFF6FF] dark:bg-[#1E3A8A]/25 text-[#1D4ED8] dark:text-[#60A5FA] whitespace-nowrap shrink-0"
+                      >
+                        <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
+                        <span>Part {part.partNumber} packaging...</span>
+                      </span>
+                    );
+                  }
+                  if (part.status === 'error') {
+                    return (
+                      <button
+                        key={part.partNumber}
+                        type="button"
+                        onClick={() => onRetryZipPart?.(part.partNumber)}
+                        disabled={isBundlingZip}
+                        title={part.error || 'Packaging failed — click to retry'}
+                        className="h-8 px-2.5 inline-flex items-center gap-1.5 text-xs font-mono tabular-nums rounded-md border border-[#B91C1C]/40 dark:border-[#F87171]/40 bg-[#FEF2F2] dark:bg-[#450A0A]/40 text-[#B91C1C] dark:text-[#F87171] hover:bg-[#FEE2E2] dark:hover:bg-[#450A0A]/70 transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
+                      >
+                        <RotateCw className="w-3 h-3" aria-hidden="true" />
+                        <span>Part {part.partNumber} · Retry</span>
+                      </button>
+                    );
+                  }
+                  return (
+                    <span
+                      key={part.partNumber}
+                      className="h-8 px-2.5 inline-flex items-center text-xs font-mono tabular-nums text-[#71717A] dark:text-[#71717A] border border-dashed border-[#E4E4E7] dark:border-[#27272A] rounded-md whitespace-nowrap shrink-0"
+                    >
+                      Part {part.partNumber} ({part.fileCount}) · Queued
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
