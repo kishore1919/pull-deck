@@ -4,15 +4,16 @@ Stateless, zero-login, zero-variable Python Instaloader worker for PullDeck.
 
 Architecture:
   - Runs strictly in memory (zero cookies, zero login, zero disk writes).
-  - Single Post / Carousel / Reel — 4-Layer Instaloader Cascade:
-      L1: Instaloader Post.from_shortcode (modern doc_id GraphQL)
-      L2: Instaloader session SSR page-data JSON tree walk (<script type="application/json">)
-      L3: Instaloader session public embed parser (/p/{shortcode}/embed/captioned/)
-      L4: Public OpenGraph metadata fallback (og:video / og:image)
+  - Single Post / Carousel / Reel — 5-Layer Instaloader Cascade:
+      L1: Instaloader logged-out Polaris Post Root GraphQL (doc_id 28891146940585796)
+      L2: Instaloader Post.from_shortcode (standard GraphQL)
+      L3: Instaloader session SSR page-data JSON tree walk (<script type="application/json">)
+      L4: Instaloader session public embed parser (/p/{shortcode}/embed/captioned/)
+      L5: Public OpenGraph metadata fallback (og:video / og:image)
   - Public Profile (@username) — Multi-Layer Instaloader Cascade (No N+1 Storm):
-      L1: Instaloader logged-out page data (get_page_data) + direct timeline node
-          serialization (zero N+1 Post.from_shortcode calls on single images) +
-          doc_id="28904005159232689" cursor pagination (ig_polaris:<token>)
+      L1: Instaloader logged-out Polaris GraphQL (doc_id 29483846714553007 +
+          27981003384861049 + 28904005159232689 cursor pagination) with
+          get_page_data fallback and budgeted video/carousel hydration
       L2: Classic Instaloader Profile.from_username (web_profile_info) +
           FrozenNodeIterator cursor resumption (ig_frozen:<token>)
       L3: Fresh-session retry with jittered backoff + partial-batch preservation
@@ -36,7 +37,10 @@ from instaloader import exceptions as ig_exc
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9._]{1,30}$")
 SHORTCODE_RE = re.compile(r"^[a-zA-Z0-9_-]{4,40}$")
 MAX_CURSOR_DECOMPRESSED_BYTES = 128 * 1024
+POLARIS_PROFILE_POSTS_DOC_ID = "29483846714553007"
+POLARIS_PROFILE_ROOT_DOC_ID = "27981003384861049"
 POLARIS_PROFILE_DOC_ID = "28904005159232689"
+POLARIS_POST_ROOT_DOC_ID = "28891146940585796"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -754,11 +758,69 @@ def extract_post_from_opengraph(
     return []
 
 
+def extract_post_from_polaris_graphql(
+    loader: instaloader.Instaloader,
+    shortcode: str,
+    source_url: str,
+    media_id: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Layer 1: Instaloader logged-out Polaris Post Root GraphQL query
+    (PolarisLoggedOutDesktopWWWPostRootContentQuery, web_api=True).
+    Returns full progressive MP4 video_versions, full carousel_media slides,
+    and full-res image_versions2 anonymously even from cloud datacenter IPs.
+    """
+    try:
+        mid = str(media_id) if media_id else str(instaloader.Post.shortcode_to_mediaid(shortcode))
+    except Exception:
+        return [], False
+
+    try:
+        resp = loader.context.doc_id_graphql_query(
+            POLARIS_POST_ROOT_DOC_ID,
+            {
+                "shortcode": shortcode,
+                "media_id": mid,
+                "__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider": False,
+            },
+            referer=f"https://www.instagram.com/p/{shortcode}/",
+            web_api=True,
+        )
+    except (ig_exc.TooManyRequestsException, ig_exc.LoginRequiredException):
+        return [], True
+    except Exception:
+        return [], False
+
+    if not isinstance(resp, dict):
+        return [], False
+
+    errors = resp.get("errors")
+    if isinstance(errors, list) and errors:
+        codes = [e.get("code") for e in errors if isinstance(e, dict)]
+        if 1675004 in codes:
+            return [], True
+
+    media_root = ((resp.get("data") or {}).get("xig_polaris_media")) or None
+    if not isinstance(media_root, dict):
+        return [], False
+
+    inner = media_root.get("if_not_gated_logged_out")
+    target_node = inner if isinstance(inner, dict) else media_root
+    items = serialize_structured_media_node(
+        target_node,
+        fallback_username="instagram",
+        fallback_shortcode=shortcode,
+        default_source_url=source_url,
+    )
+    return items, False
+
+
 def extract_post(
     loader: instaloader.Instaloader,
     shortcode: str,
     source_url: str,
     content_type: str,
+    media_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not SHORTCODE_RE.match(shortcode):
         return {"ok": False, "error": "Invalid Instagram post shortcode."}
@@ -766,7 +828,21 @@ def extract_post(
     last_error: Optional[str] = None
     rate_limited = False
 
-    # Layer 1: Native Instaloader Post.from_shortcode (modern doc_id GraphQL)
+    # Layer 1: Instaloader logged-out Polaris Post Root GraphQL (full video & carousel slides)
+    polaris_items, polaris_rl = extract_post_from_polaris_graphql(
+        loader, shortcode, source_url, media_id=media_id
+    )
+    if polaris_items:
+        return {
+            "ok": True,
+            "items": polaris_items,
+            "hasMore": False,
+            "strategyUsed": "instaloader_polaris_post",
+        }
+    if polaris_rl:
+        rate_limited = True
+
+    # Layer 2: Native Instaloader Post.from_shortcode (modern doc_id GraphQL)
     try:
         post = instaloader.Post.from_shortcode(loader.context, shortcode)
         items = serialize_instaloader_post(post, source_url)
@@ -788,7 +864,7 @@ def extract_post(
             rate_limited = True
         last_error = msg
 
-    # Layer 2: Instaloader session SSR page-data JSON tree walk
+    # Layer 3: Instaloader session SSR page-data JSON tree walk
     ssr_items, og_html_or_strategy = extract_post_from_ssr_html(
         loader, shortcode, source_url, content_type
     )
@@ -867,6 +943,27 @@ def node_needs_hydration(node: Dict[str, Any]) -> bool:
     return False
 
 
+def compact_edge_for_cursor(edge: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Strip bloated fields so leftover page-1 edges fit compactly inside cursor tokens."""
+    node = edge.get("node") if isinstance(edge, dict) else None
+    if not isinstance(node, dict):
+        return None
+    cap = node.get("caption")
+    cap_text = cap.get("text", "") if isinstance(cap, dict) else (cap if isinstance(cap, str) else "")
+    compact_node: Dict[str, Any] = {
+        "__typename": node.get("__typename"),
+        "pk": node.get("pk"),
+        "code": node.get("code") or node.get("shortcode"),
+        "media_type": node.get("media_type"),
+        "display_uri": node.get("display_uri") or node.get("display_url"),
+    }
+    if isinstance(node.get("carousel_media_count"), int):
+        compact_node["carousel_media_count"] = node["carousel_media_count"]
+    if cap_text:
+        compact_node["caption"] = {"text": cap_text[:140]}
+    return {"node": compact_node}
+
+
 def serialize_polaris_timeline_edges(
     loader: instaloader.Instaloader,
     edges: List[Dict[str, Any]],
@@ -875,13 +972,15 @@ def serialize_polaris_timeline_edges(
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Serializes Polaris timeline nodes directly (avoiding the N+1 GraphQL storm).
-    Only hydrates carousel/video nodes lacking direct URLs, with a circuit-breaker
-    so rate-limits degrade gracefully to the high-res node preview instead of failing.
+    Hydrates video/carousel nodes via PolarisLoggedOutDesktopWWWPostRootContentQuery
+    with a wall-clock budget and circuit breaker so profiles load fast and reliably.
     """
     items: List[Dict[str, Any]] = []
     hydration_throttled = False
     hydrated_count = 0
-    max_hydrations_per_page = 6
+    max_hydrations_per_page = 16
+    hydration_started_at = time.monotonic()
+    max_hydration_seconds = 14.0
 
     for edge in edges:
         node = edge.get("node") if isinstance(edge, dict) else None
@@ -889,14 +988,18 @@ def serialize_polaris_timeline_edges(
             continue
 
         shortcode = str(node.get("code") or node.get("shortcode") or "")
+        media_id = str(node.get("pk")) if node.get("pk") else None
+        within_budget = (time.monotonic() - hydration_started_at) < max_hydration_seconds
+
         if (
             shortcode
             and node_needs_hydration(node)
             and not hydration_throttled
             and hydrated_count < max_hydrations_per_page
+            and within_budget
         ):
             if hydrated_count > 0:
-                time.sleep(random.uniform(0.18, 0.42))
+                time.sleep(random.uniform(0.05, 0.14))
             hydrated_count += 1
             media_type = node.get("media_type")
             ct = "ig_reel" if media_type == 2 else "ig_post"
@@ -905,6 +1008,7 @@ def serialize_polaris_timeline_edges(
                 shortcode,
                 f"https://www.instagram.com/p/{shortcode}/",
                 ct,
+                media_id=media_id,
             )
             if hydrated.get("ok") and hydrated.get("items"):
                 items.extend(hydrated["items"])
@@ -924,6 +1028,155 @@ def serialize_polaris_timeline_edges(
     return items, hydration_throttled
 
 
+def fetch_polaris_profile_initial(
+    loader: instaloader.Instaloader,
+    username: str,
+) -> Dict[str, Any]:
+    """
+    Fetch initial public profile timeline via Instaloader's logged-out Polaris GraphQL
+    (29483846714553007 + 27981003384861049 on api/graphql), automatically falling back
+    to Instaloader's get_page_data(f"{username}/") if needed.
+    """
+    referer = f"https://www.instagram.com/{username}/"
+    gql_rate_limited = False
+
+    # 1a. Logged-out Polaris GraphQL timeline query (works on datacenter & residential IPs!)
+    try:
+        resp = loader.context.doc_id_graphql_query(
+            POLARIS_PROFILE_POSTS_DOC_ID,
+            {
+                "username": username,
+                "__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider": False,
+            },
+            referer=referer,
+            web_api=True,
+        )
+        if isinstance(resp, dict):
+            errors = resp.get("errors")
+            if isinstance(errors, list) and errors:
+                codes = [e.get("code") for e in errors if isinstance(e, dict)]
+                if 1675004 in codes:
+                    gql_rate_limited = True
+
+            user_node = ((resp.get("data") or {}).get("xig_user_by_username")) or None
+            if isinstance(user_node, dict):
+                conn = user_node.get("polaris_ordered_timeline_connection") or {}
+                raw_edges = conn.get("edges") if isinstance(conn, dict) else None
+                page_info = (conn.get("page_info") or {}) if isinstance(conn, dict) else {}
+                total_posts: Optional[int] = conn.get("count") if isinstance(conn.get("count"), int) else None
+
+                # Query lightweight profile root for total media count / private status
+                is_private = False
+                try:
+                    root_resp = loader.context.doc_id_graphql_query(
+                        POLARIS_PROFILE_ROOT_DOC_ID,
+                        {
+                            "username": username,
+                            "__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider": False,
+                        },
+                        referer=referer,
+                        web_api=True,
+                    )
+                    root_user = ((root_resp or {}).get("data") or {}).get("xig_user_by_username") or {}
+                    if isinstance(root_user, dict):
+                        is_private = bool(root_user.get("is_private"))
+                        if isinstance(root_user.get("all_media_count"), int):
+                            total_posts = root_user["all_media_count"]
+                except Exception:
+                    pass
+
+                if is_private:
+                    return {
+                        "ok": False,
+                        "private": True,
+                        "error": f"@{username} is a private Instagram account.",
+                    }
+
+                if isinstance(raw_edges, list) and len(raw_edges) > 0:
+                    return {
+                        "ok": True,
+                        "pageId": str(user_node.get("id") or ""),
+                        "edges": raw_edges,
+                        "hasNextPage": bool(page_info.get("has_next_page")),
+                        "endCursor": page_info.get("end_cursor") or None,
+                        "totalPosts": total_posts,
+                        "strategy": "instaloader_polaris_graphql",
+                    }
+            elif resp.get("data") is not None and "xig_user_by_username" in (resp.get("data") or {}):
+                # Explicitly null xig_user_by_username -> verify via profile root
+                try:
+                    root_resp = loader.context.doc_id_graphql_query(
+                        POLARIS_PROFILE_ROOT_DOC_ID,
+                        {
+                            "username": username,
+                            "__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider": False,
+                        },
+                        referer=referer,
+                        web_api=True,
+                    )
+                    root_user = ((root_resp or {}).get("data") or {}).get("xig_user_by_username")
+                    if root_user is None:
+                        return {
+                            "ok": False,
+                            "notFound": True,
+                            "error": f"Instagram profile @{username} was not found.",
+                        }
+                    if isinstance(root_user, dict) and root_user.get("is_private"):
+                        return {
+                            "ok": False,
+                            "private": True,
+                            "error": f"@{username} is a private Instagram account.",
+                        }
+                except Exception:
+                    pass
+    except (ig_exc.TooManyRequestsException, ig_exc.LoginRequiredException):
+        gql_rate_limited = True
+    except Exception:
+        pass
+
+    # 1b. Automatic fallback: Instaloader 4.16 logged-out HTML page-data parser
+    page_blocks = loader.context.get_page_data(f"{username}/")
+    if any(
+        isinstance(block, dict)
+        and (block.get("xig_user_by_username") or {}).get("is_private")
+        for block in page_blocks
+    ):
+        return {
+            "ok": False,
+            "private": True,
+            "error": f"@{username} is a private Instagram account.",
+        }
+
+    user_node = next(
+        (
+            block["xig_user_by_username"]
+            for block in page_blocks
+            if isinstance(block, dict)
+            and isinstance(block.get("xig_user_by_username"), dict)
+            and "polaris_ordered_timeline_connection" in block["xig_user_by_username"]
+        ),
+        None,
+    )
+    if not isinstance(user_node, dict):
+        return {
+            "ok": False,
+            "rateLimited": gql_rate_limited,
+            "error": f"Instagram page for @{username} did not contain public timeline data.",
+        }
+
+    conn = user_node.get("polaris_ordered_timeline_connection") or {}
+    page_info = (conn.get("page_info") or {}) if isinstance(conn, dict) else {}
+    return {
+        "ok": True,
+        "pageId": str(user_node.get("id") or ""),
+        "edges": conn.get("edges") if isinstance(conn.get("edges"), list) else [],
+        "hasNextPage": bool(page_info.get("has_next_page")),
+        "endCursor": page_info.get("end_cursor") or None,
+        "totalPosts": conn.get("count") if isinstance(conn.get("count"), int) else None,
+        "strategy": "instaloader_polaris_page",
+    }
+
+
 def extract_profile_polaris(
     loader: instaloader.Instaloader,
     username: str,
@@ -932,16 +1185,16 @@ def extract_profile_polaris(
     polaris_token: Optional[str],
 ) -> Dict[str, Any]:
     """
-    Layer 1 Profile Engine: Uses Instaloader 4.16's logged-out page data
-    (get_page_data) and Polaris doc_id pagination (28904005159232689) WITHOUT
-    calling the aggressively rate-limited web_profile_info endpoint first, and
-    WITHOUT firing N+1 Post.from_shortcode calls on every single-image post.
+    Layer 1 Profile Engine: Uses Instaloader 4.16's logged-out Polaris GraphQL
+    (29483846714553007 / 28904005159232689) and get_page_data fallback WITHOUT
+    calling the rate-limited web_profile_info endpoint, with lossless buffered pagination.
     """
     page_id: Optional[str] = None
     end_cursor: Optional[str] = None
     buffered_edges: List[Dict[str, Any]] = []
     has_next_page = False
     total_posts: Optional[int] = None
+    strategy_used = "instaloader_polaris_graphql"
 
     if polaris_token:
         decoded = decode_compressed_json(polaris_token)
@@ -949,58 +1202,32 @@ def extract_profile_polaris(
             return {"ok": False, "error": "Invalid Instagram pagination cursor."}
         page_id = str(decoded["id"])
         end_cursor = decoded.get("after") or None
-        has_next_page = bool(end_cursor)
+        has_next_page = bool(decoded.get("hasNext", bool(end_cursor)))
         if isinstance(decoded.get("total"), int):
             total_posts = decoded["total"]
+        raw_buf = decoded.get("buf")
+        if isinstance(raw_buf, list):
+            buffered_edges.extend(e for e in raw_buf if isinstance(e, dict))
     else:
-        page_blocks = loader.context.get_page_data(f"{username}/")
-        if any(
-            isinstance(block, dict)
-            and (block.get("xig_user_by_username") or {}).get("is_private")
-            for block in page_blocks
-        ):
-            return {
-                "ok": False,
-                "private": True,
-                "error": f"@{username} is a private Instagram account.",
-            }
-
-        user_node = next(
-            (
-                block["xig_user_by_username"]
-                for block in page_blocks
-                if isinstance(block, dict)
-                and isinstance(block.get("xig_user_by_username"), dict)
-                and "polaris_ordered_timeline_connection" in block["xig_user_by_username"]
-            ),
-            None,
-        )
-        if not isinstance(user_node, dict):
-            return {
-                "ok": False,
-                "error": f"Instagram page for @{username} did not contain public timeline data.",
-            }
-
-        page_id = str(user_node.get("id") or "")
-        conn = user_node.get("polaris_ordered_timeline_connection") or {}
-        if isinstance(conn, dict):
-            raw_edges = conn.get("edges")
-            if isinstance(raw_edges, list):
-                buffered_edges.extend(raw_edges)
-            page_info = conn.get("page_info") or {}
-            if isinstance(page_info, dict):
-                has_next_page = bool(page_info.get("has_next_page"))
-                end_cursor = page_info.get("end_cursor") or None
-            if isinstance(conn.get("count"), int):
-                total_posts = conn["count"]
+        init = fetch_polaris_profile_initial(loader, username)
+        if not init.get("ok"):
+            return init
+        page_id = str(init.get("pageId") or "")
+        buffered_edges.extend(init.get("edges") or [])
+        has_next_page = bool(init.get("hasNextPage"))
+        end_cursor = init.get("endCursor") or None
+        total_posts = init.get("totalPosts")
+        strategy_used = str(init.get("strategy") or strategy_used)
 
     collected_edges: List[Dict[str, Any]] = []
+    leftover_edges: List[Dict[str, Any]] = []
     partial = False
     rate_limited = False
 
     if buffered_edges:
-        take = buffered_edges[:limit]
-        collected_edges.extend(take)
+        collected_edges.extend(buffered_edges[:limit])
+        if len(buffered_edges) > limit:
+            leftover_edges = buffered_edges[limit:]
 
     # Fetch additional Polaris GraphQL pages only if we haven't reached limit yet
     gql_pages_fetched = 0
@@ -1013,7 +1240,7 @@ def extract_profile_polaris(
         and gql_pages_fetched < max_gql_pages_per_batch
     ):
         if gql_pages_fetched > 0:
-            time.sleep(random.uniform(0.25, 0.55))
+            time.sleep(random.uniform(0.18, 0.4))
         gql_pages_fetched += 1
         try:
             variables = {
@@ -1048,7 +1275,10 @@ def extract_profile_polaris(
                 has_next_page = False
                 end_cursor = None
                 break
-            collected_edges.extend(new_edges)
+            need = limit - len(collected_edges)
+            collected_edges.extend(new_edges[:need])
+            if len(new_edges) > need:
+                leftover_edges.extend(new_edges[need:])
             page_info = conn.get("page_info") or {}
             has_next_page = bool(page_info.get("has_next_page"))
             end_cursor = page_info.get("end_cursor") or None
@@ -1073,10 +1303,23 @@ def extract_profile_polaris(
 
     items, _ = serialize_polaris_timeline_edges(loader, collected_edges, username, source_url)
     next_cursor: Optional[str] = None
-    if has_next_page and end_cursor and page_id:
-        encoded_token = encode_compressed_json(
-            {"id": page_id, "after": end_cursor, "total": total_posts}
-        )
+    compact_leftovers = [c for c in (compact_edge_for_cursor(e) for e in leftover_edges) if c is not None]
+
+    if page_id and (compact_leftovers or (has_next_page and end_cursor)):
+        cursor_payload: Dict[str, Any] = {
+            "id": page_id,
+            "after": end_cursor,
+            "hasNext": bool(has_next_page and end_cursor),
+            "total": total_posts,
+        }
+        if compact_leftovers:
+            cursor_payload["buf"] = compact_leftovers
+        encoded_token = encode_compressed_json(cursor_payload)
+        if not encoded_token and compact_leftovers:
+            # Drop buffer if unexpectedly too large, preserving server cursor
+            cursor_payload.pop("buf", None)
+            if has_next_page and end_cursor:
+                encoded_token = encode_compressed_json(cursor_payload)
         if encoded_token:
             next_cursor = f"ig_polaris:{encoded_token}"
 
@@ -1088,7 +1331,7 @@ def extract_profile_polaris(
         "totalAvailable": total_posts,
         "postsFetched": len(collected_edges),
         "partial": partial,
-        "strategyUsed": "instaloader_polaris",
+        "strategyUsed": strategy_used,
     }
 
 
@@ -1210,7 +1453,7 @@ def extract_profile(
         res_l1 = extract_profile_polaris(loader_l1, username, source_url, limit, None)
         if res_l1.get("ok") and res_l1.get("items"):
             return res_l1
-        if res_l1.get("private"):
+        if res_l1.get("private") or res_l1.get("notFound"):
             return res_l1
         if res_l1.get("rateLimited"):
             rate_limited = True
