@@ -3,19 +3,22 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { ContentType } from '../../src/types.ts';
+import type { ContentType, InstagramFetchScope } from '../../src/types.ts';
 import { validateExternalUrl } from '../security.ts';
 
 export interface InstaloaderWorkerRequest {
-  contentType: ContentType;
-  sourceUrl: string;
+  action?: 'extract' | 'verify_session';
+  contentType?: ContentType;
+  sourceUrl?: string;
   username?: string;
   shortcode?: string;
   storyId?: string;
   highlightId?: string;
-  limit: number;
-  offset: number;
+  limit?: number;
+  offset?: number;
   cursor?: string;
+  sessionId?: string;
+  scope?: InstagramFetchScope;
 }
 
 export interface InstaloaderRawItem {
@@ -37,12 +40,14 @@ export interface InstaloaderRawItem {
 
 export interface InstaloaderWorkerResult {
   ok: boolean;
+  username?: string;
   items?: InstaloaderRawItem[];
   hasMore?: boolean;
   nextCursor?: string | null;
   nextOffset?: number | null;
   totalAvailable?: number | null;
   private?: boolean;
+  sessionInvalid?: boolean;
   notice?: string | null;
   rateLimited?: boolean;
   partial?: boolean;
@@ -593,6 +598,10 @@ export async function runInstaloaderWorker(
     }
   });
 
+  if (payload.action === 'verify_session') {
+    return rawResult;
+  }
+
   if (!rawResult.ok || !Array.isArray(rawResult.items)) {
     return rawResult;
   }
@@ -624,5 +633,19 @@ export async function runInstaloaderWorker(
     ...rawResult,
     ok: safeItems.length > 0,
     items: safeItems,
+  };
+}
+
+export async function verifyInstagramSession(
+  sessionId: string,
+): Promise<{ ok: boolean; username?: string; error?: string }> {
+  const result = await runInstaloaderWorker({
+    action: 'verify_session',
+    sessionId,
+  });
+  return {
+    ok: Boolean(result.ok && result.username),
+    username: result.username,
+    error: result.error,
   };
 }

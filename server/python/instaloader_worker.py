@@ -152,9 +152,26 @@ def decode_frozen_iterator(token: str) -> Optional[instaloader.FrozenNodeIterato
         return None
 
 
-def build_loader(user_agent: Optional[str] = None) -> instaloader.Instaloader:
-    """Initialize Instaloader in strictly stateless, anonymous, non-sleeping mode."""
+def sanitize_session_id(raw: Any) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    val = raw.strip()
+    if val.lower().startswith("sessionid="):
+        val = val[10:].strip()
+    if ";" in val:
+        val = val.split(";", 1)[0].strip()
+    if not val or len(val) > 512 or any(ch in val for ch in ("\r", "\n", "\0", " ")):
+        return None
+    return val
+
+
+def build_loader(
+    user_agent: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> instaloader.Instaloader:
+    """Initialize Instaloader in strictly stateless, non-sleeping, memory-only mode."""
     ua = user_agent or random.choice(USER_AGENTS)
+    clean_sid = sanitize_session_id(session_id)
     loader = instaloader.Instaloader(
         sleep=False,
         quiet=True,
@@ -169,16 +186,434 @@ def build_loader(user_agent: Optional[str] = None) -> instaloader.Instaloader:
         max_connection_attempts=1,
         request_timeout=14.0,
         fatal_status_codes=[400, 401, 403, 429],
-        iphone_support=False,
+        iphone_support=bool(clean_sid),
     )
-    # Apply realistic browser language header on anonymous session
     try:
         session = getattr(loader.context, "_session", None)
         if session is not None:
             session.headers.update({"Accept-Language": "en-US,en;q=0.9"})
+            if clean_sid:
+                session.headers.update(
+                    {
+                        "X-IG-App-ID": IG_WEB_APP_ID,
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": "https://www.instagram.com/",
+                    }
+                )
+                session.cookies.set(
+                    "sessionid",
+                    clean_sid,
+                    domain=".instagram.com",
+                    path="/",
+                )
+                uid_match = re.match(r"^(\d+)(?:%3A|:)", clean_sid, re.I)
+                if uid_match:
+                    session.cookies.set(
+                        "ds_user_id",
+                        uid_match.group(1),
+                        domain=".instagram.com",
+                        path="/",
+                    )
     except Exception:
         pass
     return loader
+
+
+def sync_session_csrf(loader: instaloader.Instaloader) -> None:
+    """Ensure X-CSRFToken header matches any csrftoken cookie returned by Instagram."""
+    try:
+        session = get_worker_session(loader)
+        if session is None:
+            return
+        csrf = session.cookies.get("csrftoken", domain=".instagram.com") or session.cookies.get("csrftoken")
+        if csrf:
+            session.headers.update({"X-CSRFToken": csrf})
+    except Exception:
+        pass
+
+
+def activate_ephemeral_session(
+    loader: instaloader.Instaloader,
+    session_id: Optional[str],
+) -> Optional[str]:
+    """Verify and bind an in-memory Instagram sessionid onto Instaloader context (never writes to disk)."""
+    clean_sid = sanitize_session_id(session_id)
+    if not clean_sid:
+        return None
+
+    # Primary: Instaloader native test_login()
+    try:
+        username = loader.test_login()
+        sync_session_csrf(loader)
+        if username:
+            loader.context.username = str(username)
+            return str(username)
+    except Exception:
+        pass
+
+    # Fallback: Instagram REST v1 current_user endpoint (handles legacy GraphQL hash throttling)
+    try:
+        session = get_worker_session(loader)
+        if session is not None:
+            resp = session.get(
+                "https://www.instagram.com/api/v1/accounts/current_user/?edit=true",
+                headers={
+                    "X-IG-App-ID": IG_WEB_APP_ID,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": "https://www.instagram.com/",
+                },
+                timeout=12,
+                allow_redirects=False,
+            )
+            sync_session_csrf(loader)
+            if resp.status_code == 200:
+                payload = resp.json()
+                user_obj = payload.get("user") if isinstance(payload, dict) else None
+                uname = user_obj.get("username") if isinstance(user_obj, dict) else None
+                if isinstance(uname, str) and uname.strip():
+                    loader.context.username = uname.strip()
+                    return uname.strip()
+    except Exception:
+        pass
+
+    return None
+
+
+def verify_instagram_session(session_id: Optional[str]) -> Dict[str, Any]:
+    clean_sid = sanitize_session_id(session_id)
+    if not clean_sid:
+        return {
+            "ok": False,
+            "error": "Paste a valid Instagram sessionid cookie value.",
+        }
+    loader = build_loader(USER_AGENTS[0], session_id=clean_sid)
+    username = activate_ephemeral_session(loader, clean_sid)
+    if username:
+        return {
+            "ok": True,
+            "username": username,
+        }
+    return {
+        "ok": False,
+        "error": (
+            "Instagram rejected or expired this sessionid cookie. "
+            "Copy a fresh sessionid from an active Instagram browser session."
+        ),
+    }
+
+
+def serialize_story_item(
+    story_item: instaloader.StoryItem,
+    username: str,
+    default_source_url: str,
+    ig_category: str,
+    title_prefix: str,
+    index: int,
+    total: int,
+) -> Optional[Dict[str, Any]]:
+    is_video = bool(getattr(story_item, "is_video", False) and getattr(story_item, "video_url", None))
+    media_url = story_item.video_url if is_video else getattr(story_item, "url", None)
+    thumb_url = getattr(story_item, "url", None) or media_url
+    if not media_url or not str(media_url).startswith("http"):
+        return None
+    media_id = str(getattr(story_item, "mediaid", "") or f"{ig_category}_{index}")
+    created_at = (
+        story_item.date_utc.isoformat() + "Z"
+        if getattr(story_item, "date_utc", None)
+        else None
+    )
+    return {
+        "mediaType": "video" if is_video else "image",
+        "mediaUrl": str(media_url),
+        "thumbnailUrl": str(thumb_url),
+        "username": username,
+        "title": f"{title_prefix} ({index}/{total})" if total > 1 else title_prefix,
+        "shortcodeOrId": f"{ig_category}_{media_id}",
+        "sourceUrl": default_source_url,
+        "index": index,
+        "total": total,
+        "createdAt": created_at,
+        "igCategory": ig_category,
+    }
+
+
+def serialize_v1_reel_media_items(
+    raw_items: List[Dict[str, Any]],
+    username: str,
+    default_source_url: str,
+    ig_category: str,
+    title_prefix: str,
+    target_story_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Serialize items returned by Instagram's authenticated /api/v1/feed/reels_media/ endpoint."""
+    filtered_nodes = [n for n in raw_items if isinstance(n, dict)]
+    if target_story_id:
+        matched = [
+            n
+            for n in filtered_nodes
+            if str(n.get("pk") or n.get("id") or "").split("_")[0] == target_story_id
+        ]
+        if matched:
+            filtered_nodes = matched
+
+    items: List[Dict[str, Any]] = []
+    total = len(filtered_nodes)
+    for idx, node in enumerate(filtered_nodes, start=1):
+        video_versions = node.get("video_versions")
+        best_video_url: Optional[str] = None
+        if isinstance(video_versions, list) and video_versions:
+            best_v = max(
+                (v for v in video_versions if isinstance(v, dict) and v.get("url")),
+                key=lambda v: (v.get("width") or 0) * (v.get("height") or 0),
+                default=None,
+            )
+            if best_v and isinstance(best_v.get("url"), str):
+                best_video_url = best_v["url"]
+
+        image_candidates = (
+            (node.get("image_versions2") or {}).get("candidates")
+            if isinstance(node.get("image_versions2"), dict)
+            else None
+        )
+        best_image_url: Optional[str] = None
+        width: Optional[int] = None
+        height: Optional[int] = None
+        if isinstance(image_candidates, list) and image_candidates:
+            best_img = max(
+                (c for c in image_candidates if isinstance(c, dict) and c.get("url")),
+                key=lambda c: (c.get("width") or 0) * (c.get("height") or 0),
+                default=None,
+            )
+            if best_img and isinstance(best_img.get("url"), str):
+                best_image_url = best_img["url"]
+                width = best_img.get("width") if isinstance(best_img.get("width"), int) else None
+                height = best_img.get("height") if isinstance(best_img.get("height"), int) else None
+
+        is_video = bool(best_video_url) or node.get("media_type") == 2
+        media_url = best_video_url if best_video_url else best_image_url
+        thumb_url = best_image_url or media_url
+        if not media_url or not media_url.startswith("http"):
+            continue
+
+        media_id = str(node.get("pk") or node.get("id") or f"{ig_category}_{idx}").split("_")[0]
+        duration = node.get("video_duration")
+        items.append(
+            {
+                "mediaType": "video" if (is_video and best_video_url) else "image",
+                "mediaUrl": media_url,
+                "thumbnailUrl": thumb_url,
+                "username": username,
+                "title": f"{title_prefix} ({idx}/{total})" if total > 1 else title_prefix,
+                "shortcodeOrId": f"{ig_category}_{media_id}",
+                "sourceUrl": default_source_url,
+                "index": idx,
+                "total": total,
+                "width": width,
+                "height": height,
+                "durationSec": round(duration) if isinstance(duration, (int, float)) else None,
+                "createdAt": iso_from_timestamp(node.get("taken_at")),
+                "igCategory": ig_category,
+            }
+        )
+    return items
+
+
+def fetch_v1_reels_media(
+    loader: instaloader.Instaloader,
+    reel_ids: List[str],
+) -> Dict[str, Any]:
+    """Fetch authenticated story/highlight reels via Instagram's REST v1 feed/reels_media endpoint."""
+    session = get_worker_session(loader)
+    if session is None or not reel_ids:
+        return {}
+    sync_session_csrf(loader)
+    params = [("reel_ids", rid) for rid in reel_ids]
+    try:
+        resp = session.get(
+            "https://www.instagram.com/api/v1/feed/reels_media/",
+            params=params,
+            headers={
+                "X-IG-App-ID": IG_WEB_APP_ID,
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": "https://www.instagram.com/",
+            },
+            timeout=14,
+        )
+        sync_session_csrf(loader)
+        if resp.status_code == 200:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                reels = payload.get("reels")
+                if isinstance(reels, dict) and reels:
+                    return reels
+                reels_media = payload.get("reels_media")
+                if isinstance(reels_media, list) and reels_media:
+                    out: Dict[str, Any] = {}
+                    for r in reels_media:
+                        if isinstance(r, dict) and r.get("id") is not None:
+                            out[str(r["id"])] = r
+                    return out
+    except Exception:
+        pass
+    return {}
+
+
+def fetch_authenticated_stories(
+    loader: instaloader.Instaloader,
+    profile: instaloader.Profile,
+    username: str,
+    target_story_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    story_url = f"https://www.instagram.com/stories/{username}/"
+    userid_str = str(profile.userid)
+
+    # Tier 1: Instaloader native get_stories(userids=[profile.userid])
+    try:
+        for story in loader.get_stories(userids=[profile.userid]):
+            raw_nodes = list(story.get_items())
+            if target_story_id:
+                filtered = [s for s in raw_nodes if str(getattr(s, "mediaid", "")) == target_story_id]
+                if filtered:
+                    raw_nodes = filtered
+            total = len(raw_nodes)
+            for idx, s_item in enumerate(raw_nodes, start=1):
+                entry = serialize_story_item(
+                    s_item,
+                    username=username,
+                    default_source_url=story_url,
+                    ig_category="story",
+                    title_prefix=f"@{username} Story",
+                    index=idx,
+                    total=total,
+                )
+                if entry:
+                    items.append(entry)
+    except Exception:
+        pass
+
+    if items:
+        return items
+
+    # Tier 2: Authenticated REST v1 /api/v1/feed/reels_media/?reel_ids={userid} fallback
+    reels = fetch_v1_reels_media(loader, [userid_str])
+    reel_obj = reels.get(userid_str) if isinstance(reels, dict) else None
+    if isinstance(reel_obj, dict) and isinstance(reel_obj.get("items"), list):
+        items = serialize_v1_reel_media_items(
+            reel_obj["items"],
+            username=username,
+            default_source_url=story_url,
+            ig_category="story",
+            title_prefix=f"@{username} Story",
+            target_story_id=target_story_id,
+        )
+    return items
+
+
+def fetch_authenticated_highlights(
+    loader: instaloader.Instaloader,
+    profile: instaloader.Profile,
+    username: str,
+    max_total_slides: int = 80,
+    target_highlight_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+
+    # Tier 1: Instaloader native get_highlights(profile)
+    try:
+        for highlight in loader.get_highlights(profile):
+            hid = str(getattr(highlight, "unique_id", "") or "")
+            if target_highlight_id and hid != target_highlight_id:
+                continue
+            hl_title = clean_caption(getattr(highlight, "title", None), "Highlight")
+            hl_url = (
+                f"https://www.instagram.com/stories/highlights/{hid}/"
+                if hid
+                else f"https://www.instagram.com/{username}/"
+            )
+            try:
+                hl_items = list(highlight.get_items())
+            except Exception:
+                continue
+            total = len(hl_items)
+            for idx, s_item in enumerate(hl_items, start=1):
+                if len(items) >= max_total_slides:
+                    return items
+                entry = serialize_story_item(
+                    s_item,
+                    username=username,
+                    default_source_url=hl_url,
+                    ig_category="highlight",
+                    title_prefix=f"Highlight: {hl_title}",
+                    index=idx,
+                    total=total,
+                )
+                if entry:
+                    items.append(entry)
+    except Exception:
+        pass
+
+    if items:
+        return items
+
+    # Tier 2: Authenticated REST v1 highlights_tray + feed/reels_media fallback
+    session = get_worker_session(loader)
+    if session is None:
+        return items
+    try:
+        sync_session_csrf(loader)
+        tray_resp = session.get(
+            f"https://www.instagram.com/api/v1/highlights/{profile.userid}/highlights_tray/",
+            headers={
+                "X-IG-App-ID": IG_WEB_APP_ID,
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"https://www.instagram.com/{username}/",
+            },
+            timeout=14,
+        )
+        if tray_resp.status_code != 200:
+            return items
+        tray_data = tray_resp.json()
+        tray = tray_data.get("tray") if isinstance(tray_data, dict) else None
+        if not isinstance(tray, list) or not tray:
+            return items
+
+        reel_meta: List[Tuple[str, str]] = []
+        for entry in tray:
+            if not isinstance(entry, dict):
+                continue
+            raw_rid = str(entry.get("id") or "")
+            hid = raw_rid.replace("highlight:", "")
+            if not hid:
+                continue
+            if target_highlight_id and hid != target_highlight_id:
+                continue
+            title = clean_caption(entry.get("title"), "Highlight")
+            reel_meta.append((f"highlight:{hid}", title))
+
+        for chunk_start in range(0, min(len(reel_meta), 20), 5):
+            chunk = reel_meta[chunk_start : chunk_start + 5]
+            reels = fetch_v1_reels_media(loader, [rid for rid, _ in chunk])
+            for rid, title in chunk:
+                reel_obj = reels.get(rid)
+                if not isinstance(reel_obj, dict) or not isinstance(reel_obj.get("items"), list):
+                    continue
+                hid = rid.replace("highlight:", "")
+                hl_url = f"https://www.instagram.com/stories/highlights/{hid}/"
+                batch = serialize_v1_reel_media_items(
+                    reel_obj["items"],
+                    username=username,
+                    default_source_url=hl_url,
+                    ig_category="highlight",
+                    title_prefix=f"Highlight: {title}",
+                )
+                for b_item in batch:
+                    if len(items) >= max_total_slides:
+                        return items
+                    items.append(b_item)
+    except Exception:
+        pass
+    return items
 
 
 def get_worker_session(loader: instaloader.Instaloader):
@@ -1164,16 +1599,59 @@ def serialize_polaris_timeline_edges(
     return items, hydration_throttled
 
 
+def edge_matches_scope(edge: Dict[str, Any], scope: str) -> bool:
+    if scope in ("all", "dp", "highlight", "story"):
+        return True
+    node = edge.get("node") if isinstance(edge.get("node"), dict) else edge
+    if not isinstance(node, dict):
+        return True
+    product_type = str(node.get("product_type") or "").lower()
+    media_type = node.get("media_type")
+    typename = str(node.get("__typename") or "").lower()
+    is_carousel = (
+        media_type == 8
+        or "sidecar" in typename
+        or bool(node.get("carousel_media"))
+        or bool(node.get("carousel_media_count"))
+    )
+    is_video = bool(node.get("is_video")) or media_type == 2 or product_type == "clips"
+    if scope == "reel":
+        return product_type == "clips"
+    if scope == "video":
+        return is_video or is_carousel
+    if scope == "photo":
+        return (not is_video) or is_carousel
+    return True
+
+
+def item_matches_scope(item: Dict[str, Any], scope: str) -> bool:
+    if scope == "all":
+        return True
+    cat = item.get("igCategory")
+    mtype = item.get("mediaType")
+    if scope == "dp":
+        return cat == "dp"
+    if scope == "highlight":
+        return cat == "highlight"
+    if scope == "story":
+        return cat == "story"
+    if scope == "reel":
+        return cat == "reel"
+    if scope == "video":
+        return mtype == "video"
+    if scope == "photo":
+        return mtype == "image" and cat not in ("dp", "highlight", "story")
+    return True
+
+
 def fetch_polaris_profile_initial(
     loader: instaloader.Instaloader,
     username: str,
+    scope: str = "all",
 ) -> Dict[str, Any]:
     """
-    Fetch initial profile metadata (HD DP + Highlights + private flag) and public
-    timeline via Instaloader's logged-out Polaris GraphQL (27981003384861049 +
-    27937681195819736 + 29483846714553007), automatically falling back to
-    Instaloader's get_page_data(f"{username}/") if needed.
-    For private profiles, returns ok=True with the full HD DP ready to download.
+    Fetch initial profile metadata and public timeline via Instaloader's logged-out
+    Polaris GraphQL queries, scoped strictly to what the user chose before fetching.
     """
     referer = f"https://www.instagram.com/{username}/"
     gql_rate_limited = False
@@ -1211,19 +1689,84 @@ def fetch_polaris_profile_initial(
         is_private = bool(root_user.get("is_private"))
         pk = str(root_user.get("pk") or "") or None
         full_name = str(root_user.get("full_name") or "").strip() or None
-        dp_item = fetch_hd_profile_dp_item(
-            loader,
-            username,
-            pk=pk,
-            fallback_pic_url=root_user.get("profile_pic_url"),
-            full_name=full_name,
-            is_private=is_private,
-        )
-        if dp_item:
-            profile_extras.append(dp_item)
 
-        # Private profile: return the HD DP cleanly so the user can download it!
+        # Ultra-fast DP-only path (~1s, works on BOTH public and private profiles, zero post queries)
+        if scope == "dp":
+            dp_item = fetch_hd_profile_dp_item(
+                loader,
+                username,
+                pk=pk,
+                fallback_pic_url=root_user.get("profile_pic_url"),
+                full_name=full_name,
+                is_private=is_private,
+            )
+            if dp_item:
+                return {
+                    "ok": True,
+                    "private": is_private,
+                    "privateDpOnly": True,
+                    "items": [dp_item],
+                    "hasMore": False,
+                    "nextCursor": None,
+                    "totalAvailable": 1,
+                    "postsFetched": 0,
+                    "strategy": "instaloader_polaris_dp_only",
+                    "notice": (
+                        f"@{username} is a private account — full HD profile picture (DP) is ready to download."
+                        if is_private
+                        else f"Extracted full HD profile picture (DP) for @{username}."
+                    ),
+                }
+            return {
+                "ok": False,
+                "private": is_private,
+                "error": f"Could not load profile picture (DP) for @{username}.",
+            }
+
+        # Ultra-fast Highlights-only path (~1s, zero post queries)
+        if scope == "highlight":
+            if is_private:
+                return {
+                    "ok": False,
+                    "private": True,
+                    "error": (
+                        f"@{username} is a private account — Highlights are hidden unless you connect a Session "
+                        "that follows them. Switch to DP above to download their HD profile picture."
+                    ),
+                }
+            hl_items = extract_highlight_cover_items(root_user, username)
+            if hl_items:
+                return {
+                    "ok": True,
+                    "private": False,
+                    "privateDpOnly": True,
+                    "items": hl_items,
+                    "hasMore": False,
+                    "nextCursor": None,
+                    "totalAvailable": len(hl_items),
+                    "postsFetched": 0,
+                    "strategy": "instaloader_polaris_highlights_only",
+                    "notice": (
+                        f"Extracted {len(hl_items)} Highlight cover {'image' if len(hl_items) == 1 else 'images'} for @{username}. "
+                        "Connect Session unlock for all individual slides inside Highlights."
+                    ),
+                }
+            return {
+                "ok": False,
+                "notFound": True,
+                "error": f"No public Highlights found on @{username}.",
+            }
+
+        # Private profile when requesting All / Photos / Videos / Reels -> still return HD DP cleanly!
         if is_private:
+            dp_item = fetch_hd_profile_dp_item(
+                loader,
+                username,
+                pk=pk,
+                fallback_pic_url=root_user.get("profile_pic_url"),
+                full_name=full_name,
+                is_private=True,
+            )
             if dp_item:
                 return {
                     "ok": True,
@@ -1246,8 +1789,19 @@ def fetch_polaris_profile_initial(
                 "error": f"@{username} is a private Instagram account and no profile picture was returned.",
             }
 
-        # Public profile: collect Highlight tray covers too
-        profile_extras.extend(extract_highlight_cover_items(root_user, username))
+        # Only bundle DP + Highlights when scope == "all"
+        if scope == "all":
+            dp_item = fetch_hd_profile_dp_item(
+                loader,
+                username,
+                pk=pk,
+                fallback_pic_url=root_user.get("profile_pic_url"),
+                full_name=full_name,
+                is_private=False,
+            )
+            if dp_item:
+                profile_extras.append(dp_item)
+            profile_extras.extend(extract_highlight_cover_items(root_user, username))
 
     # Step 2: Logged-out Polaris GraphQL timeline query (works on datacenter & residential IPs!)
     try:
@@ -1377,11 +1931,12 @@ def extract_profile_polaris(
     source_url: str,
     limit: int,
     polaris_token: Optional[str],
+    scope: str = "all",
 ) -> Dict[str, Any]:
     """
     Layer 1 Profile Engine: Uses Instaloader 4.16's logged-out Polaris GraphQL
-    (27981003384861049 / 27937681195819736 / 29483846714553007 / 28904005159232689)
-    with HD DP (public & private profiles), Highlights, and lossless buffered pagination.
+    with targeted per-scope fetching (DP, Highlights, Reels, Videos, Photos, All)
+    and lossless buffered pagination.
     """
     page_id: Optional[str] = None
     end_cursor: Optional[str] = None
@@ -1404,7 +1959,7 @@ def extract_profile_polaris(
         if isinstance(raw_buf, list):
             buffered_edges.extend(e for e in raw_buf if isinstance(e, dict))
     else:
-        init = fetch_polaris_profile_initial(loader, username)
+        init = fetch_polaris_profile_initial(loader, username, scope=scope)
         if init.get("privateDpOnly"):
             return init
         if not init.get("ok"):
@@ -1499,12 +2054,14 @@ def extract_profile_polaris(
             "error": f"No public posts returned for @{username}.",
         }
 
+    # Pre-filter edges before hydration so we NEVER waste hydration calls on unwanted media types
+    scoped_edges = [e for e in collected_edges if edge_matches_scope(e, scope)]
     timeline_items, _ = (
-        serialize_polaris_timeline_edges(loader, collected_edges, username, source_url)
-        if collected_edges
+        serialize_polaris_timeline_edges(loader, scoped_edges, username, source_url)
+        if scoped_edges
         else ([], False)
     )
-    items = [*profile_extras, *timeline_items]
+    items = [item for item in [*profile_extras, *timeline_items] if item_matches_scope(item, scope)]
     next_cursor: Optional[str] = None
     compact_leftovers = [c for c in (compact_edge_for_cursor(e) for e in leftover_edges) if c is not None]
 
@@ -1519,20 +2076,37 @@ def extract_profile_polaris(
             cursor_payload["buf"] = compact_leftovers
         encoded_token = encode_compressed_json(cursor_payload)
         if not encoded_token and compact_leftovers:
-            # Drop buffer if unexpectedly too large, preserving server cursor
             cursor_payload.pop("buf", None)
             if has_next_page and end_cursor:
                 encoded_token = encode_compressed_json(cursor_payload)
         if encoded_token:
             next_cursor = f"ig_polaris:{encoded_token}"
 
+    if not items:
+        scope_names = {
+            "photo": "photos",
+            "video": "videos",
+            "reel": "reels",
+            "dp": "profile picture",
+            "highlight": "highlights",
+            "story": "stories",
+        }
+        label = scope_names.get(scope, "posts")
+        return {
+            "ok": False,
+            "notFound": True,
+            "error": f"No {label} found in this batch for @{username}.",
+            "hasMore": bool(next_cursor),
+            "nextCursor": next_cursor,
+        }
+
     return {
-        "ok": len(items) > 0,
+        "ok": True,
         "items": items,
         "hasMore": bool(next_cursor),
         "nextCursor": next_cursor,
-        "totalAvailable": total_posts,
-        "postsFetched": len(collected_edges),
+        "totalAvailable": total_posts if (scope == "all" and isinstance(total_posts, int)) else None,
+        "postsFetched": len(scoped_edges),
         "partial": partial,
         "strategyUsed": strategy_used,
     }
@@ -1545,40 +2119,48 @@ def extract_profile_classic(
     limit: int,
     offset: int,
     frozen_cursor: Optional[str],
+    scope: str = "all",
 ) -> Dict[str, Any]:
     """
     Layer 2 Profile Engine: Classic Instaloader Profile.from_username (web_profile_info)
-    with FrozenNodeIterator cursor resumption and partial-batch preservation if throttled.
+    with targeted scope filtering and FrozenNodeIterator cursor resumption.
     """
     profile = instaloader.Profile.from_username(loader.context, username)
-    if profile.is_private:
+    if scope == "dp" or profile.is_private:
         dp_item = fetch_hd_profile_dp_item(
             loader,
             username,
-            source_url,
-            str(getattr(profile, "userid", "") or "") or None,
-            getattr(profile, "profile_pic_url", None),
+            pk=str(getattr(profile, "userid", "") or "") or None,
+            fallback_pic_url=getattr(profile, "profile_pic_url", None),
+            full_name=str(getattr(profile, "full_name", "") or "").strip() or None,
+            is_private=bool(profile.is_private),
         )
         if dp_item:
             return {
                 "ok": True,
-                "private": True,
+                "private": bool(profile.is_private),
                 "privateDpOnly": True,
                 "items": [dp_item],
                 "hasMore": False,
                 "nextCursor": None,
                 "totalAvailable": 1,
                 "postsFetched": 0,
-                "strategyUsed": "instaloader_classic_private_dp",
+                "strategyUsed": "instaloader_classic_dp",
                 "notice": (
                     f"@{username} is a private account — posts, reels, highlights, and stories are hidden by Instagram, "
                     "but the full HD profile picture (DP) is ready to download."
+                    if profile.is_private
+                    else f"Extracted full HD profile picture (DP) for @{username}."
                 ),
             }
         return {
             "ok": False,
-            "private": True,
-            "error": f"@{username} is a private Instagram account.",
+            "private": bool(profile.is_private),
+            "error": (
+                f"@{username} is a private Instagram account."
+                if profile.is_private
+                else f"Could not load profile picture (DP) for @{username}."
+            ),
         }
 
     total_posts = getattr(profile, "mediacount", None)
@@ -1631,20 +2213,23 @@ def extract_profile_classic(
                 next_cursor = f"ig_loader:{offset + len(page_posts)}"
 
     items: List[Dict[str, Any]] = []
-    if offset == 0 and not frozen_cursor:
+    if scope == "all" and offset == 0 and not frozen_cursor:
         dp_item = fetch_hd_profile_dp_item(
             loader,
             username,
-            source_url,
-            str(getattr(profile, "userid", "") or "") or None,
-            getattr(profile, "profile_pic_url", None),
+            pk=str(getattr(profile, "userid", "") or "") or None,
+            fallback_pic_url=getattr(profile, "profile_pic_url", None),
+            full_name=str(getattr(profile, "full_name", "") or "").strip() or None,
+            is_private=False,
         )
         if dp_item:
             items.append(dp_item)
 
     for post in page_posts:
         try:
-            items.extend(serialize_instaloader_post(post, source_url))
+            for entry in serialize_instaloader_post(post, source_url):
+                if item_matches_scope(entry, scope):
+                    items.append(entry)
         except Exception:
             continue
 
@@ -1653,10 +2238,367 @@ def extract_profile_classic(
         "items": items,
         "hasMore": bool(has_more and next_cursor),
         "nextCursor": next_cursor,
-        "totalAvailable": total_posts if isinstance(total_posts, int) else None,
+        "totalAvailable": total_posts if (scope == "all" and isinstance(total_posts, int)) else None,
         "postsFetched": len(page_posts),
         "partial": partial,
         "strategyUsed": "instaloader_classic",
+    }
+
+
+def extract_profile_authenticated(
+    session_id: str,
+    username: str,
+    source_url: str,
+    limit: int,
+    offset: int,
+    frozen_cursor: Optional[str],
+    scope: str = "all",
+) -> Dict[str, Any]:
+    """
+    Authenticated Instaloader Profile Engine (ephemeral in-memory sessionid).
+    Fetches ONLY the requested scope: DP, Stories, Highlights, Reels, Videos, Photos, or All.
+    """
+    loader = build_loader(USER_AGENTS[0], session_id=session_id)
+    viewer = activate_ephemeral_session(loader, session_id)
+    if not viewer:
+        return {
+            "ok": False,
+            "sessionInvalid": True,
+            "error": (
+                "Your connected Instagram session expired or was challenged. "
+                "Disconnect or paste a fresh sessionid cookie."
+            ),
+        }
+
+    profile = instaloader.Profile.from_username(loader.context, username)
+    is_own_profile = viewer.lower() == username.lower()
+    can_view_private = (not profile.is_private) or bool(getattr(profile, "followed_by_viewer", False)) or is_own_profile
+
+    # Ultra-fast DP-only path
+    if scope == "dp":
+        dp_item = fetch_hd_profile_dp_item(
+            loader,
+            username,
+            pk=str(getattr(profile, "userid", "") or "") or None,
+            fallback_pic_url=getattr(profile, "profile_pic_url", None),
+            full_name=str(getattr(profile, "full_name", "") or "").strip() or None,
+            is_private=bool(profile.is_private),
+        )
+        if dp_item:
+            return {
+                "ok": True,
+                "private": bool(profile.is_private and not can_view_private),
+                "privateDpOnly": True,
+                "items": [dp_item],
+                "hasMore": False,
+                "nextCursor": None,
+                "totalAvailable": 1,
+                "postsFetched": 0,
+                "strategyUsed": "instaloader_session_dp",
+                "notice": f"Extracted full HD profile picture (DP) for @{username}.",
+            }
+        return {"ok": False, "error": f"Could not load profile picture (DP) for @{username}."}
+
+    if not can_view_private:
+        dp_item = fetch_hd_profile_dp_item(
+            loader,
+            username,
+            pk=str(getattr(profile, "userid", "") or "") or None,
+            fallback_pic_url=getattr(profile, "profile_pic_url", None),
+            full_name=str(getattr(profile, "full_name", "") or "").strip() or None,
+            is_private=True,
+        )
+        if dp_item:
+            return {
+                "ok": True,
+                "private": True,
+                "privateDpOnly": True,
+                "items": [dp_item],
+                "hasMore": False,
+                "nextCursor": None,
+                "totalAvailable": 1,
+                "postsFetched": 0,
+                "strategyUsed": "instaloader_session_private_dp",
+                "notice": (
+                    f"@{username} is private and not followed by @{viewer} — posts, reels, highlights, and stories are hidden, "
+                    "but the full HD profile picture (DP) is ready to download."
+                ),
+            }
+        return {
+            "ok": False,
+            "private": True,
+            "error": f"@{username} is a private Instagram account not followed by @{viewer}.",
+        }
+
+    # Ultra-fast Stories-only path (skips posts, highlights, DP!)
+    if scope == "story":
+        story_items = fetch_authenticated_stories(loader, profile, username)
+        if story_items:
+            return {
+                "ok": True,
+                "items": story_items,
+                "hasMore": False,
+                "nextCursor": None,
+                "totalAvailable": len(story_items),
+                "postsFetched": 0,
+                "strategyUsed": "instaloader_session_stories_only",
+                "notice": f"Extracted {len(story_items)} active Story {'item' if len(story_items) == 1 else 'items'} for @{username}.",
+            }
+        return {
+            "ok": False,
+            "notFound": True,
+            "error": f"No active 24-hour Stories found for @{username} right now.",
+        }
+
+    # Ultra-fast Highlights-only path (skips posts, stories, DP!)
+    if scope == "highlight":
+        hl_items = fetch_authenticated_highlights(loader, profile, username, max_total_slides=120)
+        if hl_items:
+            return {
+                "ok": True,
+                "items": hl_items,
+                "hasMore": False,
+                "nextCursor": None,
+                "totalAvailable": len(hl_items),
+                "postsFetched": 0,
+                "strategyUsed": "instaloader_session_highlights_only",
+                "notice": f"Extracted {len(hl_items)} Highlight {'slide' if len(hl_items) == 1 else 'slides'} for @{username}.",
+            }
+        return {
+            "ok": False,
+            "notFound": True,
+            "error": f"No Highlights found on @{username}.",
+        }
+
+    total_posts = getattr(profile, "mediacount", None)
+    posts_iter = profile.get_posts()
+    thawed = False
+
+    if frozen_cursor:
+        frozen_obj = decode_frozen_iterator(frozen_cursor)
+        if frozen_obj is not None:
+            try:
+                posts_iter.thaw(frozen_obj)
+                thawed = True
+            except Exception:
+                thawed = False
+
+    page_posts: List[instaloader.Post] = []
+    partial = False
+    iterator = (
+        itertools.islice(posts_iter, limit)
+        if thawed
+        else itertools.islice(posts_iter, offset, offset + limit)
+    )
+
+    try:
+        for post in iterator:
+            page_posts.append(post)
+    except (ig_exc.TooManyRequestsException, ig_exc.LoginRequiredException, ig_exc.ConnectionException):
+        if not page_posts:
+            raise
+        partial = True
+
+    has_more = False
+    next_cursor: Optional[str] = None
+    if len(page_posts) > 0 and (len(page_posts) == limit or partial):
+        try:
+            frozen_state = posts_iter.freeze()
+            encoded = encode_frozen_iterator(frozen_state)
+            if encoded:
+                rem = frozen_state.remaining_data or {}
+                page_info = rem.get("page_info") if isinstance(rem, dict) else None
+                edges = rem.get("edges") if isinstance(rem, dict) else None
+                if (isinstance(edges, list) and len(edges) > 0) or (
+                    isinstance(page_info, dict) and page_info.get("has_next_page")
+                ):
+                    has_more = True
+                    next_cursor = f"ig_frozen:{encoded}"
+        except Exception:
+            if isinstance(total_posts, int) and (offset + len(page_posts) < total_posts):
+                has_more = True
+                next_cursor = f"ig_loader:{offset + len(page_posts)}"
+
+    items: List[Dict[str, Any]] = []
+    if scope == "all" and offset == 0 and not frozen_cursor:
+        dp_item = fetch_hd_profile_dp_item(
+            loader,
+            username,
+            pk=str(getattr(profile, "userid", "") or "") or None,
+            fallback_pic_url=getattr(profile, "profile_pic_url", None),
+            full_name=str(getattr(profile, "full_name", "") or "").strip() or None,
+            is_private=False,
+        )
+        if dp_item:
+            items.append(dp_item)
+        items.extend(fetch_authenticated_stories(loader, profile, username))
+        items.extend(fetch_authenticated_highlights(loader, profile, username, max_total_slides=60))
+
+    for post in page_posts:
+        try:
+            for entry in serialize_instaloader_post(post, source_url):
+                if item_matches_scope(entry, scope):
+                    items.append(entry)
+        except Exception:
+            continue
+
+    return {
+        "ok": len(items) > 0,
+        "items": items,
+        "hasMore": bool(has_more and next_cursor),
+        "nextCursor": next_cursor,
+        "totalAvailable": total_posts if (scope == "all" and isinstance(total_posts, int)) else None,
+        "postsFetched": len(page_posts),
+        "partial": partial,
+        "strategyUsed": "instaloader_session",
+    }
+
+
+def extract_story_or_highlight_authenticated(
+    session_id: str,
+    content_type: str,
+    source_url: str,
+    username: Optional[str],
+    story_id: Optional[str],
+    highlight_id: Optional[str],
+) -> Dict[str, Any]:
+    loader = build_loader(USER_AGENTS[0], session_id=session_id)
+    viewer = activate_ephemeral_session(loader, session_id)
+    if not viewer:
+        return {
+            "ok": False,
+            "sessionInvalid": True,
+            "error": (
+                "Your connected Instagram session expired or was challenged. "
+                "Paste a fresh sessionid cookie to fetch Stories and Highlights."
+            ),
+        }
+
+    if content_type == "ig_story" and username and USERNAME_RE.match(username):
+        profile = instaloader.Profile.from_username(loader.context, username)
+        items = fetch_authenticated_stories(loader, profile, username, target_story_id=story_id)
+        if items:
+            return {
+                "ok": True,
+                "items": items,
+                "hasMore": False,
+                "nextCursor": None,
+                "totalAvailable": len(items),
+                "strategyUsed": "instaloader_session_stories",
+            }
+        return {
+            "ok": False,
+            "error": f"No active 24-hour Stories found for @{username} right now.",
+        }
+
+    if content_type == "ig_highlight" and highlight_id:
+        try:
+            reel_key = f"highlight:{highlight_id}"
+            data = loader.context.graphql_query(
+                "45246d3fe16ccc6577e0bd297a5db1ab",
+                {
+                    "reel_ids": [],
+                    "tag_names": [],
+                    "location_ids": [],
+                    "highlight_reel_ids": [highlight_id],
+                    "precomposed_overlay": False,
+                },
+            )
+            reels_media = (data.get("data") or {}).get("reels_media") or []
+            if isinstance(reels_media, list) and reels_media:
+                reel_node = reels_media[0]
+                owner = reel_node.get("owner") or {}
+                hl_owner = str(owner.get("username") or username or "instagram")
+                hl_title = clean_caption(reel_node.get("title"), f"Highlight {highlight_id}")
+                raw_items = reel_node.get("items") or []
+                total = len(raw_items)
+                items: List[Dict[str, Any]] = []
+                for idx, node in enumerate(raw_items, start=1):
+                    if not isinstance(node, dict):
+                        continue
+                    is_video = bool(node.get("is_video"))
+                    media_url: Optional[str] = None
+                    if is_video:
+                        v_res = node.get("video_resources")
+                        if isinstance(v_res, list) and v_res:
+                            best_v = max(
+                                (v for v in v_res if isinstance(v, dict) and v.get("src")),
+                                key=lambda v: (v.get("config_width") or 0) * (v.get("config_height") or 0),
+                                default=None,
+                            )
+                            if best_v:
+                                media_url = best_v.get("src")
+                    disp = node.get("display_url")
+                    if not media_url:
+                        media_url = disp
+                    if not isinstance(media_url, str) or not media_url.startswith("http"):
+                        continue
+                    items.append(
+                        {
+                            "mediaType": "video" if is_video and media_url != disp else "image",
+                            "mediaUrl": media_url,
+                            "thumbnailUrl": disp if isinstance(disp, str) and disp.startswith("http") else media_url,
+                            "username": hl_owner,
+                            "title": f"Highlight: {hl_title} ({idx}/{total})" if total > 1 else f"Highlight: {hl_title}",
+                            "shortcodeOrId": f"highlight_{node.get('id') or idx}",
+                            "sourceUrl": source_url,
+                            "index": idx,
+                            "total": total,
+                            "createdAt": iso_from_timestamp(node.get("taken_at_timestamp")),
+                            "igCategory": "highlight",
+                        }
+                    )
+                if items:
+                    return {
+                        "ok": True,
+                        "items": items,
+                        "hasMore": False,
+                        "nextCursor": None,
+                        "totalAvailable": len(items),
+                        "strategyUsed": "instaloader_session_highlight",
+                    }
+        except Exception:
+            pass
+
+        # Fallback: direct REST v1 /api/v1/feed/reels_media/?reel_ids=highlight:{id}
+        try:
+            reel_key = f"highlight:{highlight_id}"
+            reels = fetch_v1_reels_media(loader, [reel_key])
+            reel_obj = reels.get(reel_key)
+            if isinstance(reel_obj, dict) and isinstance(reel_obj.get("items"), list):
+                owner = reel_obj.get("user") or reel_obj.get("owner") or {}
+                hl_owner = str(owner.get("username") or username or "instagram")
+                hl_title = clean_caption(reel_obj.get("title"), f"Highlight {highlight_id}")
+                v1_items = serialize_v1_reel_media_items(
+                    reel_obj["items"],
+                    username=hl_owner,
+                    default_source_url=source_url,
+                    ig_category="highlight",
+                    title_prefix=f"Highlight: {hl_title}",
+                )
+                if v1_items:
+                    return {
+                        "ok": True,
+                        "items": v1_items,
+                        "hasMore": False,
+                        "nextCursor": None,
+                        "totalAvailable": len(v1_items),
+                        "strategyUsed": "instaloader_session_highlight_v1",
+                    }
+        except Exception:
+            pass
+
+        return {
+            "ok": False,
+            "error": (
+                f"Could not fetch Highlight {highlight_id} directly. "
+                "Paste the user's profile URL instead to pull all their Highlights."
+            ),
+        }
+
+    return {
+        "ok": False,
+        "error": "Provide a valid Instagram Story or Highlight URL.",
     }
 
 
@@ -1666,28 +2608,63 @@ def extract_profile(
     limit: int,
     offset: int,
     cursor: Optional[str],
+    session_id: Optional[str] = None,
+    scope: str = "all",
 ) -> Dict[str, Any]:
     if not USERNAME_RE.match(username):
         return {"ok": False, "error": "Invalid Instagram username format."}
+
+    clean_sid = sanitize_session_id(session_id)
+    valid_scopes = {"all", "photo", "video", "reel", "dp", "highlight", "story"}
+    effective_scope = scope if scope in valid_scopes else "all"
+
+    if effective_scope == "story" and not clean_sid:
+        return {
+            "ok": False,
+            "sessionInvalid": True,
+            "error": (
+                "Active 24-hour Stories require an Instagram session. "
+                "Open Session unlock above to connect a temporary sessionid."
+            ),
+        }
 
     # Direct continuation for cursor-resumed pages
     if cursor and cursor.startswith("ig_polaris:"):
         token = cursor[11:]
         loader = build_loader()
-        return extract_profile_polaris(loader, username, source_url, limit, token)
+        return extract_profile_polaris(loader, username, source_url, limit, token, scope=effective_scope)
 
     if cursor and cursor.startswith("ig_frozen:"):
         token = cursor[10:]
+        if clean_sid:
+            return extract_profile_authenticated(clean_sid, username, source_url, limit, offset, token, scope=effective_scope)
         loader = build_loader()
-        return extract_profile_classic(loader, username, source_url, limit, offset, token)
+        return extract_profile_classic(loader, username, source_url, limit, offset, token, scope=effective_scope)
+
+    # Optional Ephemeral Session Path (unlocks Stories, full Highlight slides, and followed private profiles)
+    if clean_sid:
+        try:
+            res_auth = extract_profile_authenticated(clean_sid, username, source_url, limit, offset, None, scope=effective_scope)
+            if res_auth.get("ok") and res_auth.get("items"):
+                return res_auth
+            if res_auth.get("private") or res_auth.get("sessionInvalid") or res_auth.get("notFound"):
+                return res_auth
+        except ig_exc.ProfileNotExistsException:
+            return {"ok": False, "error": f"Instagram profile @{username} was not found."}
+        except Exception:
+            if effective_scope == "story":
+                return {
+                    "ok": False,
+                    "error": f"Could not load active Stories for @{username} using the connected session.",
+                }
 
     errors: List[str] = []
     rate_limited = False
 
-    # Layer 1: Instaloader logged-out page data + direct timeline node serialization
+    # Layer 1: Instaloader logged-out Polaris GraphQL (scoped strictly to effective_scope)
     try:
         loader_l1 = build_loader(USER_AGENTS[0])
-        res_l1 = extract_profile_polaris(loader_l1, username, source_url, limit, None)
+        res_l1 = extract_profile_polaris(loader_l1, username, source_url, limit, None, scope=effective_scope)
         if res_l1.get("ok") and res_l1.get("items"):
             return res_l1
         if res_l1.get("private") or res_l1.get("notFound"):
@@ -1707,38 +2684,39 @@ def extract_profile(
             rate_limited = True
         errors.append(msg)
 
-    # Layer 2: Classic Instaloader web_profile_info + FrozenNodeIterator (with fresh session)
-    try:
-        time.sleep(random.uniform(0.2, 0.45))
-        loader_l2 = build_loader(USER_AGENTS[1])
-        res_l2 = extract_profile_classic(loader_l2, username, source_url, limit, offset, None)
-        if res_l2.get("ok") and res_l2.get("items"):
-            return res_l2
-        if res_l2.get("private"):
-            return res_l2
-        if res_l2.get("error"):
-            errors.append(str(res_l2["error"]))
-    except ig_exc.ProfileNotExistsException:
-        return {"ok": False, "error": f"Instagram profile @{username} was not found."}
-    except ig_exc.PrivateProfileNotFollowedException:
-        return {"ok": False, "error": f"@{username} is a private Instagram account."}
-    except (ig_exc.LoginRequiredException, ig_exc.TooManyRequestsException) as exc:
-        rate_limited = True
-        errors.append(str(exc))
-    except ig_exc.ConnectionException as exc:
-        msg = str(exc)
-        if any(code in msg for code in ("401", "403", "429")):
+    # Layer 2: Classic Instaloader web_profile_info + FrozenNodeIterator (skip if highlight-only since classic needs login for highlights)
+    if effective_scope != "highlight":
+        try:
+            time.sleep(random.uniform(0.2, 0.45))
+            loader_l2 = build_loader(USER_AGENTS[1])
+            res_l2 = extract_profile_classic(loader_l2, username, source_url, limit, offset, None, scope=effective_scope)
+            if res_l2.get("ok") and res_l2.get("items"):
+                return res_l2
+            if res_l2.get("private"):
+                return res_l2
+            if res_l2.get("error"):
+                errors.append(str(res_l2["error"]))
+        except ig_exc.ProfileNotExistsException:
+            return {"ok": False, "error": f"Instagram profile @{username} was not found."}
+        except ig_exc.PrivateProfileNotFollowedException:
+            return {"ok": False, "error": f"@{username} is a private Instagram account."}
+        except (ig_exc.LoginRequiredException, ig_exc.TooManyRequestsException) as exc:
             rate_limited = True
-        errors.append(msg)
-    except Exception as exc:
-        errors.append(str(exc))
+            errors.append(str(exc))
+        except ig_exc.ConnectionException as exc:
+            msg = str(exc)
+            if any(code in msg for code in ("401", "403", "429")):
+                rate_limited = True
+            errors.append(msg)
+        except Exception as exc:
+            errors.append(str(exc))
 
     # Layer 3: One final clean-session Polaris retry with distinct User-Agent on transient throttling
     if rate_limited:
         try:
             time.sleep(random.uniform(0.45, 0.85))
             loader_l3 = build_loader(USER_AGENTS[2])
-            res_l3 = extract_profile_polaris(loader_l3, username, source_url, limit, None)
+            res_l3 = extract_profile_polaris(loader_l3, username, source_url, limit, None, scope=effective_scope)
             if res_l3.get("ok") and res_l3.get("items"):
                 return res_l3
         except Exception:
@@ -1750,7 +2728,7 @@ def extract_profile(
             "rateLimited": True,
             "error": (
                 f"Instagram blocked anonymous profile access for @{username} from this cloud server IP. "
-                "Single public post, carousel, and reel links still work automatically, or run PullDeck locally on a home network for full Instaloader profile access."
+                "Single public post, carousel, and reel links still work automatically, or connect a temporary Session."
             ),
         }
 
@@ -1766,11 +2744,21 @@ def main() -> None:
         emit({"ok": False, "error": "Invalid JSON payload supplied to Instaloader worker."})
         return
 
+    action = str(req.get("action") or "extract").strip()
+    session_id = sanitize_session_id(req.get("sessionId"))
+
+    if action == "verify_session":
+        emit(verify_instagram_session(session_id))
+        return
+
     content_type = str(req.get("contentType") or "")
     source_url = str(req.get("sourceUrl") or "")
     username = str(req.get("username") or "").strip().lstrip("@")
     shortcode = str(req.get("shortcode") or "").strip()
+    story_id = str(req.get("storyId") or "").strip() or None
+    highlight_id = str(req.get("highlightId") or "").strip() or None
     cursor = str(req.get("cursor") or "").strip() or None
+    scope = str(req.get("scope") or "all").strip().lower()
 
     # Backward compatibility with frozenCursor field
     if not cursor and req.get("frozenCursor"):
@@ -1788,15 +2776,30 @@ def main() -> None:
 
     try:
         if content_type == "ig_profile" and username:
-            result = extract_profile(username, source_url, limit, offset, cursor)
+            result = extract_profile(username, source_url, limit, offset, cursor, session_id=session_id, scope=scope)
         elif content_type in ("ig_post", "ig_reel") and shortcode:
-            loader = build_loader()
+            loader = build_loader(session_id=session_id)
+            if session_id:
+                activate_ephemeral_session(loader, session_id)
             result = extract_post(loader, shortcode, source_url, content_type)
         elif content_type in ("ig_story", "ig_highlight"):
-            result = {
-                "ok": False,
-                "error": "Instagram requires an account login for Stories and Highlights. Public profiles, posts, carousels, and reels work without login.",
-            }
+            if session_id:
+                result = extract_story_or_highlight_authenticated(
+                    session_id,
+                    content_type,
+                    source_url,
+                    username or None,
+                    story_id,
+                    highlight_id,
+                )
+            else:
+                result = {
+                    "ok": False,
+                    "error": (
+                        "Instagram requires a session for Stories and full Highlight slides. "
+                        "Open Session Unlock above to connect a temporary sessionid, or paste a public profile URL for posts, reels, HD DP, and Highlight covers."
+                    ),
+                }
         else:
             result = {"ok": False, "error": "Unsupported Instagram workload target."}
 

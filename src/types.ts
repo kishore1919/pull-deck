@@ -22,6 +22,15 @@ export type InstagramCategory =
   | 'highlight'
   | 'story';
 
+export type InstagramFetchScope =
+  | 'all'
+  | 'photo'
+  | 'video'
+  | 'reel'
+  | 'dp'
+  | 'highlight'
+  | 'story';
+
 export type MediaType = 'image' | 'video';
 
 export type JobStatus =
@@ -90,6 +99,7 @@ export interface ExtractionJob {
   resolverUsed?: string;
   authHint?: string;
   isPrivateProfile?: boolean;
+  instagramScope?: InstagramFetchScope;
   hasMore?: boolean;
   nextCursor?: string;
   pageNumber?: number;
@@ -101,6 +111,7 @@ export interface BatchExtractRequest {
   subredditSort?: 'hot' | 'top' | 'new';
   cursor?: string;
   pageNumber?: number;
+  instagramScope?: InstagramFetchScope;
 }
 
 export interface BatchExtractResponse {

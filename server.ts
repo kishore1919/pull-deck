@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { ReadableStream as WebReadableStream } from 'node:stream/web';
@@ -11,6 +12,7 @@ import type {
   BatchExtractResponse,
   CapabilitiesResponse,
   ExtractionJob,
+  InstagramFetchScope,
   MediaItem,
   ZipDownloadRequest,
 } from './src/types.ts';
@@ -19,6 +21,7 @@ import { extractInstagramUrl } from './server/extractors/instagram.ts';
 import {
   detectInstaloaderRuntime,
   ensureInstaloaderRuntime,
+  verifyInstagramSession,
 } from './server/extractors/instaloaderBridge.ts';
 import { extractRedditUrl } from './server/extractors/reddit.ts';
 import {
@@ -50,6 +53,21 @@ const ALLOWED_PROXY_CONTENT_TYPES = [
   'video/',
   'application/octet-stream',
 ];
+
+function sanitizeInstagramSessionHeader(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  let val = raw.trim();
+  if (val.toLowerCase().startsWith('sessionid=')) {
+    val = val.slice(10).trim();
+  }
+  if (val.includes(';')) {
+    val = val.split(';', 1)[0].trim();
+  }
+  if (!val || val.length > 512 || /[\r\n\0\s]/.test(val)) {
+    return undefined;
+  }
+  return val;
+}
 
 function buildUpstreamMediaHeaders(mediaUrl: string): Record<string, string> {
   const headers: Record<string, string> = {
@@ -113,6 +131,35 @@ async function startServer() {
     res.json(payload);
   });
 
+  // 1b. Ephemeral Instagram Session Verification (never stored, never logged, never echoed)
+  app.post('/api/instagram/session/verify', async (req, res) => {
+    const sessionId = sanitizeInstagramSessionHeader(req.header('x-instagram-session'));
+    if (!sessionId) {
+      res.status(400).json({ ok: false, error: 'Provide a valid Instagram sessionid cookie value.' });
+      return;
+    }
+
+    try {
+      const verified = await verifyInstagramSession(sessionId);
+      res.setHeader('Cache-Control', 'no-store');
+      if (!verified.ok) {
+        res.status(401).json({
+          ok: false,
+          error:
+            verified.error ||
+            'Instagram rejected or expired this sessionid cookie.',
+        });
+        return;
+      }
+      res.json({ ok: true, username: verified.username });
+    } catch {
+      res.status(502).json({
+        ok: false,
+        error: 'Unable to verify Instagram session right now.',
+      });
+    }
+  });
+
   // 2. Single, Profile (Paginated) & Bulk URL Extraction
   app.post('/api/extract/batch', async (req, res) => {
     const body = req.body as Partial<BatchExtractRequest> | undefined;
@@ -149,6 +196,24 @@ async function startServer() {
       body.pageNumber <= 500
         ? body.pageNumber
         : 1;
+
+    const instagramSessionId = sanitizeInstagramSessionHeader(
+      req.header('x-instagram-session'),
+    );
+    const ALLOWED_IG_SCOPES = new Set<InstagramFetchScope>([
+      'all',
+      'photo',
+      'video',
+      'reel',
+      'dp',
+      'highlight',
+      'story',
+    ]);
+    const instagramScope: InstagramFetchScope =
+      typeof body.instagramScope === 'string' &&
+      ALLOWED_IG_SCOPES.has(body.instagramScope as InstagramFetchScope)
+        ? (body.instagramScope as InstagramFetchScope)
+        : 'all';
 
     const results = await runWithConcurrency(
       rawUrls,
@@ -208,6 +273,8 @@ async function startServer() {
           pageLimit,
           effectiveCursor,
           pageNumber,
+          instagramSessionId,
+          instagramScope,
         );
       },
     );
@@ -329,10 +396,57 @@ async function startServer() {
         ? body.partLabel.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32)
         : '';
 
+    const extractCleanUser = (
+      item: Pick<ZipDownloadRequest['items'][number], 'author' | 'sourceContainer'>,
+    ): string => {
+      for (const candidate of [item.author, item.sourceContainer]) {
+        const raw = (candidate || '').trim();
+        if (!raw) continue;
+        const stripped = raw
+          .replace(/^@+/, '')
+          .replace(/^u\//i, '')
+          .replace(/^r\//i, '');
+        if (
+          !stripped ||
+          /^\[?deleted\]?$/i.test(stripped) ||
+          stripped.toLowerCase() === 'unknown'
+        ) {
+          continue;
+        }
+        const cleaned = stripped
+          .replace(/[^a-zA-Z0-9._-]+/g, '_')
+          .replace(/_+/g, '_')
+          .replace(/^[._-]+|[._-]+$/g, '')
+          .slice(0, 32);
+        if (cleaned) return cleaned;
+      }
+      return '';
+    };
+
+    const seenNames = new Set<string>();
+    const uniqueNames: string[] = [];
+    for (const item of items) {
+      const cleaned = extractCleanUser(item);
+      if (!cleaned) continue;
+      const lower = cleaned.toLowerCase();
+      if (!seenNames.has(lower)) {
+        seenNames.add(lower);
+        uniqueNames.push(cleaned);
+      }
+    }
+    const userSlug =
+      uniqueNames.length === 0
+        ? 'pulldeck'
+        : uniqueNames.length === 1
+          ? uniqueNames[0]
+          : uniqueNames.length === 2
+            ? `${uniqueNames[0]}_${uniqueNames[1]}`.slice(0, 56)
+            : `${uniqueNames[0]}_${uniqueNames[1]}_plus${uniqueNames.length - 2}`.slice(0, 56);
+
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const archiveFilename = safePartLabel
-      ? `pulldeck-${safePartLabel}-${timestamp}.zip`
-      : `pulldeck-bundle-${timestamp}.zip`;
+      ? `${userSlug}-${safePartLabel}-${timestamp}.zip`
+      : `${userSlug}-bundle-${timestamp}.zip`;
 
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${archiveFilename}"`);
@@ -471,8 +585,12 @@ async function startServer() {
 
         const fallbackExt = item.mediaType === 'video' ? 'mp4' : 'jpg';
         const safeName = sanitizeFilename(item.filename, fallbackExt);
+        const userFolder = sanitizeFolderSegment(
+          extractCleanUser(item) || item.sourceContainer,
+          'media',
+        );
         const folderPrefix = organizeByFolder
-          ? `${sanitizeFolderSegment(item.platform)}/${sanitizeFolderSegment(item.sourceContainer, 'media')}/`
+          ? `${sanitizeFolderSegment(item.platform)}/${userFolder}/`
           : '';
 
         let entryPath = `${folderPrefix}${safeName}`;
@@ -531,12 +649,17 @@ async function startServer() {
     await archive.finalize();
   });
 
+  const httpServer = http.createServer(app);
+
   // 5. Frontend Serving (Vite middleware in dev, dist/ static in prod)
   const isProduction = process.env.NODE_ENV === 'production';
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -553,7 +676,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`PullDeck server listening on http://0.0.0.0:${PORT}`);
     // Automatically prepare Python Instaloader venv in background on fresh containers
     void ensureInstaloaderRuntime();

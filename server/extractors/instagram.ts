@@ -3,6 +3,7 @@ import type {
   ContentType,
   ExtractionJob,
   InstagramCategory,
+  InstagramFetchScope,
   MediaItem,
 } from '../../src/types.ts';
 import { sanitizeFilename } from '../security.ts';
@@ -125,6 +126,8 @@ export async function extractInstagramUrl(
   limit = 30,
   cursor?: string,
   pageNumber = 1,
+  sessionId?: string,
+  scope: InstagramFetchScope = 'all',
 ): Promise<{ job: ExtractionJob; items: MediaItem[] }> {
   const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 100);
   const parsed = parseInstagramPath(sourceUrl);
@@ -144,18 +147,23 @@ export async function extractInstagramUrl(
   };
   const contentLabel = labelMap[contentType];
 
-  if (contentType === 'ig_story' || contentType === 'ig_highlight') {
+  if (
+    ((contentType === 'ig_story' || contentType === 'ig_highlight') ||
+      (contentType === 'ig_profile' && scope === 'story')) &&
+    !sessionId
+  ) {
     return {
       job: {
         id: jobId,
         sourceUrl,
         platform: 'instagram',
         contentType,
-        contentLabel,
-        status: 'error',
+        contentLabel: scope === 'story' ? 'Instagram Stories' : contentLabel,
+        status: 'auth_required',
         message:
-          'Instagram requires an account login for Stories and Highlights. Public profiles, posts, carousels, and reels work without login.',
+          'Active 24-hour Stories require an Instagram session. Open Session unlock above to connect a temporary sessionid, or choose DP, Highlights, Reels, Videos, Photos, or All for zero-login downloads.',
         itemCount: 0,
+        instagramScope: scope,
         hasMore: false,
         pageNumber,
       },
@@ -185,6 +193,8 @@ export async function extractInstagramUrl(
     limit: safeLimit,
     offset,
     cursor: workerCursor,
+    sessionId,
+    scope,
   });
 
   if (workerResult.ok && workerResult.items && workerResult.items.length > 0) {
@@ -221,9 +231,7 @@ export async function extractInstagramUrl(
 
     const resolvedLabel = isPrivateProfile
       ? 'Private Profile · HD DP'
-      : (contentType === 'ig_post' || contentType === 'ig_reel') && items.length > 1
-        ? 'Instagram Carousel'
-        : contentLabel;
+      : contentLabel;
 
     const partialSuffix = workerResult.partial
       ? ' (paused early due to Instagram rate limit)'
@@ -245,8 +253,9 @@ export async function extractInstagramUrl(
           typeof workerResult.totalAvailable === 'number'
             ? workerResult.totalAvailable
             : undefined,
-        resolverUsed: 'Python Instaloader',
+        resolverUsed: sessionId ? 'Python Instaloader (Session)' : 'Python Instaloader',
         isPrivateProfile,
+        instagramScope: scope,
         hasMore: Boolean(workerResult.hasMore && nextCursor),
         nextCursor,
         pageNumber,
@@ -262,11 +271,12 @@ export async function extractInstagramUrl(
       platform: 'instagram',
       contentType,
       contentLabel,
-      status: 'error',
+      status: workerResult.sessionInvalid ? 'auth_required' : 'error',
       message:
         workerResult.error ||
         `Could not fetch media from ${parsed.username ? `@${parsed.username}` : 'this Instagram link'} via Instaloader.`,
       itemCount: 0,
+      instagramScope: scope,
       hasMore: false,
       pageNumber,
     },

@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { CheckCircle2, X, XCircle } from 'lucide-react';
+import { CheckCircle2, WifiOff, X, XCircle } from 'lucide-react';
 import type {
   BatchExtractResponse,
   CapabilitiesResponse,
   ContentType,
   ExtractionJob,
+  InstagramFetchScope,
   MediaItem,
   Platform,
   ZipOptions,
@@ -15,6 +16,8 @@ import { IntakeRail, type IntakeMode } from './components/IntakeRail';
 import { StagingDeck, type MediaTypeFilter } from './components/StagingDeck';
 import { LightboxModal } from './components/LightboxModal';
 import { buildProxyUrl } from './components/MediaThumbnail';
+import { useOnlineStatus } from './hooks/usePWAInstall';
+import { classifyUrl } from './utils/urlParser';
 import {
   canHashItemThumbnail,
   computeThumbnailDHash,
@@ -95,6 +98,53 @@ function buildSmartZipChunks(
   return chunks;
 }
 
+/**
+ * Extracts a clean, filesystem-safe username slug from selected items
+ * (Instagram @handle, Reddit u/username, RedGIFs @creator) so downloaded
+ * ZIP archives and extracted folders always identify the user rather than subreddits.
+ */
+function extractCleanUsername(item: Pick<MediaItem, 'author' | 'sourceContainer'>): string {
+  const candidates = [item.author, item.sourceContainer];
+  for (const candidate of candidates) {
+    const raw = (candidate || '').trim();
+    if (!raw) continue;
+    const stripped = raw
+      .replace(/^@+/, '')
+      .replace(/^u\//i, '')
+      .replace(/^r\//i, '');
+    if (!stripped || /^\[?deleted\]?$/i.test(stripped) || stripped.toLowerCase() === 'unknown') {
+      continue;
+    }
+    const cleaned = stripped
+      .replace(/[^a-zA-Z0-9._-]+/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^[._-]+|[._-]+$/g, '')
+      .slice(0, 32);
+    if (cleaned) return cleaned;
+  }
+  return '';
+}
+
+function buildUsernameSlug(chosenItems: MediaItem[]): string {
+  const seen = new Set<string>();
+  const names: string[] = [];
+
+  for (const item of chosenItems) {
+    const cleaned = extractCleanUsername(item);
+    if (!cleaned) continue;
+    const lower = cleaned.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      names.push(cleaned);
+    }
+  }
+
+  if (names.length === 0) return 'pulldeck';
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]}_${names[1]}`.slice(0, 56);
+  return `${names[0]}_${names[1]}_plus${names.length - 2}`.slice(0, 56);
+}
+
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [activePlatform, setActivePlatform] = useState<Platform>('instagram');
@@ -143,6 +193,17 @@ export default function App() {
   const zipPartsRef = useRef<ZipPartDownloadItem[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
+
+  // Mobile/Desktop auto-fetch on paste, before-fetch Instagram scope & ephemeral memory-only session
+  const [autoFetchOnPaste, setAutoFetchOnPaste] = useState(true);
+  const [instagramScope, setInstagramScope] = useState<InstagramFetchScope>('all');
+  const [igSession, setIgSession] = useState<{
+    sessionId: string;
+    username: string;
+  } | null>(null);
+  const [isVerifyingIgSession, setIsVerifyingIgSession] = useState(false);
+  const shareTargetConsumedRef = useRef(false);
+  const isOnline = useOnlineStatus();
 
   const maxZipImages = capabilities?.maxZipItems ?? 60;
   const maxZipVideos = capabilities?.maxZipVideoItems ?? 25;
@@ -439,6 +500,60 @@ export default function App() {
     [activeSelectedItems, maxZipImages, maxZipVideos],
   );
 
+  function buildExtractHeaders(includeIgSession: boolean): Record<string, string> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (includeIgSession && igSession?.sessionId) {
+      headers['X-Instagram-Session'] = igSession.sessionId;
+    }
+    return headers;
+  }
+
+  async function handleConnectIgSession(rawSessionId: string): Promise<boolean> {
+    const trimmed = rawSessionId.trim();
+    if (!trimmed || isVerifyingIgSession) return false;
+    setIsVerifyingIgSession(true);
+    try {
+      const response = await fetch('/api/instagram/session/verify', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Instagram-Session': trimmed,
+        },
+        body: JSON.stringify({}),
+      });
+      const data = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        username?: string;
+        error?: string;
+      };
+      if (!response.ok || !data.ok || !data.username) {
+        showToast(
+          'error',
+          data.error || 'Could not verify Instagram sessionid cookie.',
+        );
+        return false;
+      }
+      setIgSession({ sessionId: trimmed, username: data.username });
+      showToast(
+        'success',
+        `Session connected as @${data.username} — Stories, full Highlights & followed private profiles unlocked.`,
+      );
+      return true;
+    } catch {
+      showToast('error', 'Unable to verify Instagram session right now.');
+      return false;
+    } finally {
+      setIsVerifyingIgSession(false);
+    }
+  }
+
+  function handleDisconnectIgSession() {
+    setIgSession(null);
+    showToast('success', 'Instagram session disconnected (back to zero-login mode).');
+  }
+
   async function fetchNextPageForJob(
     job: ExtractionJob,
     runId?: number,
@@ -448,11 +563,15 @@ export default function App() {
 
     const response = await fetch('/api/extract/batch', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: buildExtractHeaders(job.platform === 'instagram'),
       body: JSON.stringify({
         urls: [job.sourceUrl],
         cursor: job.nextCursor,
         pageNumber: nextPage,
+        instagramScope:
+          job.platform === 'instagram'
+            ? job.instagramScope || instagramScope
+            : undefined,
       }),
     });
 
@@ -624,10 +743,17 @@ export default function App() {
     setIsExtracting(true);
 
     try {
+      const hasInstagramUrl = urls.some((u) =>
+        /(instagram\.com|instagr\.am)/i.test(u),
+      );
+      const activeScopeForRun = instagramScope;
       const response = await fetch('/api/extract/batch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls }),
+        headers: buildExtractHeaders(hasInstagramUrl),
+        body: JSON.stringify({
+          urls,
+          instagramScope: hasInstagramUrl ? activeScopeForRun : undefined,
+        }),
       });
 
       if (!response.ok) {
@@ -650,14 +776,22 @@ export default function App() {
         incomingPlatformByJob.set(j.id, j.platform);
       }
 
+      const replacedUrls = new Set(data.jobs.map((j) => j.sourceUrl));
+      const replacedJobIds = new Set(
+        jobs.filter((j) => replacedUrls.has(j.sourceUrl)).map((j) => j.id),
+      );
+      const removedItemIds = new Set(
+        items.filter((m) => replacedJobIds.has(m.jobId)).map((m) => m.id),
+      );
+
       setJobs((prev) => {
-        const replacedUrls = new Set(data.jobs.map((j) => j.sourceUrl));
         return [...data.jobs, ...prev.filter((j) => !replacedUrls.has(j.sourceUrl))];
       });
 
       setItems((prev) => {
+        const kept = prev.filter((m) => !replacedJobIds.has(m.jobId));
         const existingKeys = new Set(
-          prev.map((m) => itemSubmissionKey(m, jobPlatformById.get(m.jobId) ?? null)),
+          kept.map((m) => itemSubmissionKey(m, jobPlatformById.get(m.jobId) ?? null)),
         );
         const fresh = data.items.filter((m) => {
           const key = itemSubmissionKey(
@@ -668,11 +802,14 @@ export default function App() {
           existingKeys.add(key);
           return true;
         });
-        return [...fresh, ...prev];
+        return [...fresh, ...kept];
       });
 
       setSelectedIds((prev) => {
         const next = new Set(prev);
+        for (const id of removedItemIds) {
+          next.delete(id);
+        }
         for (const item of data.items) {
           next.add(item.id);
         }
@@ -693,22 +830,25 @@ export default function App() {
           : undefined;
 
       if (data.items.length > 0) {
-        const privateDpJob =
-          data.jobs.length === 1 && data.jobs[0]?.isPrivateProfile
+        const privateDpOnlyJob =
+          data.jobs.length === 1 &&
+          data.jobs[0]?.isPrivateProfile &&
+          data.items.every((item) => item.igCategory === 'dp')
             ? data.jobs[0]
             : undefined;
 
-        if (privateDpJob) {
-          setTypeFilter('dp');
+        if (privateDpOnlyJob) {
+          setTypeFilter('all');
           showToast(
             'success',
-            privateDpJob.message || 'Private profile — HD DP ready to download.',
+            privateDpOnlyJob.message || 'Private profile — HD DP ready to download.',
           );
           return;
         }
 
+        setTypeFilter('all');
+
         if (autoStreamProfileJob) {
-          setTypeFilter('all');
           const totalHint = autoStreamProfileJob.totalAvailable
             ? ` of ${autoStreamProfileJob.totalAvailable}`
             : '';
@@ -720,10 +860,11 @@ export default function App() {
           void streamRemainingPages(autoStreamProfileJob);
           return;
         }
-        setTypeFilter('all');
         showToast(
           'success',
-          `Loaded ${data.items.length} ${data.items.length === 1 ? 'file' : 'files'}.`,
+          data.jobs.length === 1 && data.jobs[0]?.message && firstResolvedPlatform === 'instagram' && activeScopeForRun !== 'all'
+            ? data.jobs[0].message
+            : `Loaded ${data.items.length} ${data.items.length === 1 ? 'file' : 'files'}.`,
         );
       } else {
         const firstIssue = data.jobs.find((j) => j.status !== 'ready');
@@ -741,6 +882,46 @@ export default function App() {
       setIsExtracting(false);
     }
   }
+
+  // Handle Android PWA Share Target (?url=... / ?text=...) & iOS Shortcut auto-fetch links on launch
+  useEffect(() => {
+    if (shareTargetConsumedRef.current) return;
+    shareTargetConsumedRef.current = true;
+
+    const params = new URLSearchParams(window.location.search);
+    const rawCandidates = [
+      params.get('url') || '',
+      params.get('text') || '',
+      params.get('title') || '',
+    ].filter(Boolean);
+
+    if (rawCandidates.length === 0) return;
+
+    let extractedUrl: string | null = null;
+    for (const candidate of rawCandidates) {
+      const urlMatch = candidate.match(/https?:\/\/[^\s]+/i);
+      const toCheck = (urlMatch ? urlMatch[0] : candidate).trim();
+      const classified = classifyUrl(toCheck);
+      if (classified.valid && classified.platform) {
+        extractedUrl = classified.normalized;
+        setActivePlatform(classified.platform);
+        setIntakeMode('single');
+        setInputsByPlatform((prev) => ({
+          ...prev,
+          [classified.platform!]: classified.normalized,
+        }));
+        break;
+      }
+    }
+
+    // Clear query parameters cleanly without page reload
+    window.history.replaceState({}, '', window.location.pathname);
+
+    if (extractedUrl) {
+      void runExtraction([extractedUrl]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function handleLoadMore(job: ExtractionJob) {
     if (!job.nextCursor || isExtracting || loadingMoreJobUrl || autoLoadingJobUrl) {
@@ -877,9 +1058,10 @@ export default function App() {
     const lines = activeSelectedItems.map((item) => item.mediaUrl).join('\n') + '\n';
     const blob = new Blob([lines], { type: 'text/plain;charset=utf-8' });
     const blobUrl = URL.createObjectURL(blob);
+    const userSlug = buildUsernameSlug(activeSelectedItems);
     const a = document.createElement('a');
     a.href = blobUrl;
-    a.download = `pulldeck-${activePlatform}-${activeSelectedItems.length}-urls.txt`;
+    a.download = `${userSlug}-${activePlatform}-${activeSelectedItems.length}-urls.txt`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1015,16 +1197,17 @@ export default function App() {
     // Single ZIP fast path
     if (chunks.length === 1) {
       const chunk = chunks[0];
+      const userSlug = buildUsernameSlug(chunk);
       setZipProgressLabel('Packaging ZIP...');
       try {
         const blob = await buildZipPartBlob(chunk);
         const blobUrl = URL.createObjectURL(blob);
-        const filename = `pulldeck-${activePlatform}-${chunk.length}-files.zip`;
+        const filename = `${userSlug}-${activePlatform}-${chunk.length}-files.zip`;
         triggerBlobDownload(blobUrl, filename);
         setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
         showToast(
           'success',
-          `Downloaded ZIP (${chunk.length} ${chunk.length === 1 ? 'file' : 'files'}).`,
+          `Downloaded ${filename} (${chunk.length} ${chunk.length === 1 ? 'file' : 'files'}).`,
         );
       } catch (err) {
         showToast(
@@ -1041,11 +1224,12 @@ export default function App() {
     // Multi-Part ZIP Queue: builds all parts, keeps Blobs in memory for 0ms 1-click save
     // so browser/iframe automatic multi-download blocks NEVER lose parts 3..N
     const targetPlatform = activePlatform;
+    const batchUserSlug = buildUsernameSlug(activeSelectedItems);
     const initialParts: ZipPartDownloadItem[] = chunks.map((chunk, idx) => ({
       partNumber: idx + 1,
       totalParts: chunks.length,
       fileCount: chunk.length,
-      filename: `pulldeck-${targetPlatform}-part-${idx + 1}-of-${chunks.length}.zip`,
+      filename: `${batchUserSlug}-${targetPlatform}-part-${idx + 1}-of-${chunks.length}.zip`,
       status: 'pending',
       items: chunk,
     }));
@@ -1142,7 +1326,7 @@ export default function App() {
         onToggleTheme={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
       />
 
-      <main className="flex-1 max-w-[1200px] w-full mx-auto px-4 sm:px-8 py-6 flex flex-col gap-5">
+      <main className="flex-1 max-w-[1200px] w-full mx-auto px-3 sm:px-8 pt-3.5 sm:py-6 pb-[calc(5.25rem+env(safe-area-inset-bottom))] sm:pb-6 flex flex-col gap-3.5 sm:gap-5">
         <IntakeRail
           platform={activePlatform}
           mode={intakeMode}
@@ -1156,6 +1340,14 @@ export default function App() {
           isExtracting={isExtracting}
           onExtract={runExtraction}
           capabilities={capabilities}
+          autoFetchOnPaste={autoFetchOnPaste}
+          onToggleAutoFetchOnPaste={() => setAutoFetchOnPaste((prev) => !prev)}
+          instagramScope={instagramScope}
+          onInstagramScopeChange={setInstagramScope}
+          igSessionUsername={igSession?.username ?? null}
+          isVerifyingIgSession={isVerifyingIgSession}
+          onConnectIgSession={handleConnectIgSession}
+          onDisconnectIgSession={handleDisconnectIgSession}
         />
 
         <StagingDeck
@@ -1226,6 +1418,7 @@ export default function App() {
           onLoadMore={handleLoadMore}
           onLoadAll={handleLoadAll}
           onStopLoadAll={handleStopLoadAll}
+          hasInstagramSession={Boolean(igSession)}
         />
       </main>
 
@@ -1243,11 +1436,22 @@ export default function App() {
         />
       )}
 
+      {!isOnline && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-[calc(4.5rem+env(safe-area-inset-bottom))] left-3 right-3 sm:right-auto sm:bottom-5 sm:left-5 z-50 bg-white dark:bg-[#18181B] border border-[#E4E4E7] dark:border-[#27272A] rounded-lg px-3.5 py-2.5 sm:py-2 shadow-sm flex items-center gap-2 text-xs text-[#B45309] dark:text-[#FBBF24]"
+        >
+          <WifiOff className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+          <span className="font-medium">Offline — reconnect to fetch new media.</span>
+        </div>
+      )}
+
       {toast && (
         <div
           role="status"
           aria-live="polite"
-          className="fixed bottom-5 right-5 z-50 max-w-sm bg-white dark:bg-[#18181B] border border-[#E4E4E7] dark:border-[#27272A] rounded-lg px-4 py-3 shadow-sm flex items-center gap-3 text-sm"
+          className="fixed bottom-[calc(4.5rem+env(safe-area-inset-bottom))] left-3 right-3 sm:left-auto sm:bottom-5 sm:right-5 z-50 sm:max-w-sm bg-white dark:bg-[#18181B] border border-[#E4E4E7] dark:border-[#27272A] rounded-lg px-4 py-3 shadow-md sm:shadow-sm flex items-center gap-3 text-sm"
         >
           {toast.tone === 'success' ? (
             <CheckCircle2
@@ -1260,14 +1464,14 @@ export default function App() {
               aria-hidden="true"
             />
           )}
-          <span className="text-[#09090B] dark:text-[#FAFAFA] text-xs font-medium leading-snug">
+          <span className="flex-1 text-[#09090B] dark:text-[#FAFAFA] text-xs font-medium leading-snug">
             {toast.message}
           </span>
           <button
             type="button"
             onClick={() => setToast(null)}
             aria-label="Dismiss notification"
-            className="text-[#71717A] dark:text-[#A1A1AA] hover:text-[#09090B] dark:hover:text-[#FAFAFA] ml-1 shrink-0"
+            className="min-w-[32px] min-h-[32px] -mr-1.5 inline-flex items-center justify-center text-[#71717A] dark:text-[#A1A1AA] hover:text-[#09090B] dark:hover:text-[#FAFAFA] shrink-0"
           >
             <X className="w-3.5 h-3.5" />
           </button>
